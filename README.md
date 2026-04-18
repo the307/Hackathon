@@ -76,12 +76,20 @@ flowchart LR
 ## CLI
 
 ```bash
+python main.py
+```
+
+По умолчанию запуск идет по встроенному пути `ПДнDataset/share` в корне проекта.
+
+Явно задать путь тоже можно:
+
+```bash
 python main.py "ПДнDataset/share" --output result.csv --output-format csv
 ```
 
 Параметры:
 
-- `root` — корневая директория сканирования.
+- `root` — корневая директория сканирования; если не передан, используется `ПДнDataset/share`.
 - `--output` — путь к отчету; для хакатона основной файл должен быть `result.csv`.
 - `--output-format` — `csv`, `json`, `md`; `csv` пишет строгий формат `size,time,name`.
 - `--include-ext` — список расширений для анализа.

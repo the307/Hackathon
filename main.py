@@ -7,12 +7,22 @@ from models import DEFAULT_EXTENSIONS, ScanConfig
 from reporting import write_report
 from scanner import scan_root
 
+DEFAULT_DATASET_ROOT = Path(__file__).resolve().parent / "ПДнDataset" / "share"
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="CLI-сканер для поиска персональных данных в файловом хранилище."
     )
-    parser.add_argument("root", help="Корневая директория или одиночный файл для анализа.")
+    parser.add_argument(
+        "root",
+        nargs="?",
+        default=str(DEFAULT_DATASET_ROOT),
+        help=(
+            "Корневая директория или одиночный файл для анализа. "
+            f"По умолчанию: {DEFAULT_DATASET_ROOT}"
+        ),
+    )
     parser.add_argument(
         "-o",
         "--output",
