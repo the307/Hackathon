@@ -5,6 +5,19 @@ striprtf>=0.0.26
 xlrd>=2.0.1
 openpyxl>=3.1.0
 
+# html (обработка .html + .pdf-файлов, которые физически HTML)
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# structured (parquet-стриминг через Arrow)
+# См. https://arrow.apache.org/docs/python/parquet.html
+pyarrow>=14.0.0
+
+# шифрованные PDF (pypdf требует cryptography>=3.1 для AES-зашифрованных
+# файлов; без неё такие PDF падают с DependencyError). Проверено: в
+# датасете 1 такой файл (SciFinder%20Discovery%20Platform.pdf).
+cryptography>=3.1
+
 # images (OCR)
 # pytesseract - обёртка над системным Tesseract OCR. ТРЕБУЕТ отдельной
 # установки бинарника Tesseract + языковых данных (rus, eng) - см.

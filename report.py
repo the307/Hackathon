@@ -321,13 +321,50 @@ def write_markdown(report: Report, path: Path) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_txt(report: Report, path: Path) -> None:
+    """Плоский текстовый список: одна строка = один файл.
+
+    Формат:   [УЗ-N]  группы         имя_файла        (путь)
+    Отсортирован от наиболее опасных (УЗ-1) к безопасным.
+    """
+    def sort_key(row: ReportRow):
+        uz = row.uz_level if row.uz_level is not None else 99
+        return (uz, -row.total_findings, row.filename.lower())
+
+    s = report.summary
+    lines: List[str] = []
+    lines.append(f"PII scan: {s.root}")
+    lines.append(f"Time:     {s.scanned_at}")
+    lines.append(
+        f"Total:    {s.total_files}  (with PII: {s.files_with_pii}, "
+        f"UZ-1/2/3/4/none: "
+        f"{s.uz_distribution.get('1',0)}/{s.uz_distribution.get('2',0)}/"
+        f"{s.uz_distribution.get('3',0)}/{s.uz_distribution.get('4',0)}/"
+        f"{s.uz_distribution.get('none',0)})"
+    )
+    lines.append("-" * 100)
+    lines.append(f"{'UZ':<6} {'GROUPS':<32} {'FILE':<50} PATH")
+    lines.append("-" * 100)
+    for r in sorted(report.rows, key=sort_key):
+        uz = f"UZ-{r.uz_level}" if r.uz_level is not None else "none"
+        groups = ",".join(sorted(r.groups.keys())) if r.groups else "-"
+        # обрезаем длинные имена, чтобы строка оставалась читаемой
+        fn_disp = r.filename if len(r.filename) <= 48 else (r.filename[:45] + "...")
+        lines.append(f"{uz:<6} {groups:<32} {fn_disp:<50} {r.path}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_all(report: Report, output_dir: Path, stem: str = "pii_report") -> Dict[str, Path]:
-    """Пишет все три формата рядом. Возвращает dict{'json':..., 'csv':..., 'md':...}."""
+    """Пишет все четыре формата рядом. JSON - полные детали, CSV -
+    плоская таблица, Markdown - сводка для проверяющих, TXT - быстрый
+    обзор "файл -> классификация"."""
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"{stem}.json"
     csv_path = output_dir / f"{stem}.csv"
     md_path = output_dir / f"{stem}.md"
+    txt_path = output_dir / f"{stem}.txt"
     write_json(report, json_path)
     write_csv(report, csv_path)
     write_markdown(report, md_path)
-    return {"json": json_path, "csv": csv_path, "md": md_path}
+    write_txt(report, txt_path)
+    return {"json": json_path, "csv": csv_path, "md": md_path, "txt": txt_path}

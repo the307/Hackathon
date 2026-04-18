@@ -175,29 +175,58 @@ PATTERNS = {
 # 4. СЛОВАРНЫЕ ДЕТЕКТОРЫ (биометрия, спец. категории, контекст)
 # ===========================================================================
 
+# ВАЖНО: ключевые слова матчатся по word boundaries (re.search со \b), а не
+# подстрокой. Иначе "вич" ловит "Иванович", "спид" ловит "спидометр",
+# "этнич" ловит любую "техничную" ерунду, "инвалид" срабатывает на
+# единичное упоминание в юридическом тексте. Проверено на полном прогоне
+# (998 HEALTH findings в патентных документах ЮФУ - почти всё было ложным).
+# \b в Python 3 корректно работает с Unicode/кириллицей.
 KEYWORDS_BIOMETRIC = [
-    "отпечат", "дактилоск", "радужн",
-    "голосов образц", "голосовой образц",
-    "биометр", "геном",
-    "лицев биометр", "лицевая биометр",
+    r"отпечат(ок|ка|ков|ки)? пальц",
+    r"дактилоскоп",
+    r"радужн\w* оболоч",
+    r"голосов\w+ образ",
+    r"\bбиометри",
+    r"\bгеном\w*\b",
+    r"лицев\w+ биометри",
 ]
 
+# HEALTH: требуем словосочетания, а не одиночные слова. "Инвалид" один -
+# не повод ставить УЗ-1. "Диагноз X", "группа крови", "ВИЧ-инфек" - да.
 KEYWORDS_HEALTH = [
-    "диагноз", "группа крови", "группу крови",
-    "вич", "спид", "беременн", "инвалид", "инвалидност",
-    "хронич забол", "медицинск заключ", "справк о состоян здоров",
-    "псих расстрой", "онколог",
+    r"\bдиагноз\w*\b",
+    r"групп[аыу]\s+крови",
+    r"\bВИЧ[-\s]",
+    r"\bСПИД\w*",
+    r"беременн(ость|ая|ой|ости)",
+    r"инвалидност",
+    r"\bинвалид(ы|ов|ам|ами|ах)?\b",
+    r"хронич\w+\s+заболев",
+    r"медицинск\w+\s+заключ",
+    r"справк\w+\s+о\s+состоян\w+\s+здоров",
+    r"псих\w*\s+расстрой",
+    r"онколог\w+",
 ]
 
 KEYWORDS_RELIGION_POLITICS = [
-    "православн", "мусульман", "католик", "буддист", "атеист",
-    "иудей", "религиозн убежд", "религиозные убежд",
-    "политическ убежд", "член парти", "партийн принадлеж",
+    r"\bправославн\w+",
+    r"\bмусульман\w+",
+    r"\bкатолик\w*",
+    r"\bбуддист\w*",
+    r"\bиудей\w*",
+    r"религиозн\w+\s+убежд",
+    r"политическ\w+\s+убежд",
+    r"член\s+парти",
+    r"партийн\w+\s+принадлежност",
 ]
 
+# Было "этнич" substring - ловило "техничный". Сузили до корней этно-/расов-
+# в связке с национальностью/происхождением.
 KEYWORDS_RACE_NATIONALITY = [
-    "национальност", "расов принадлеж",
-    "этническ происхожд", "этнич",
+    r"национальност\w*",
+    r"расов\w+\s+принадлежност",
+    r"этническ\w+\s+(происхожден|принадлежност|состав)",
+    r"\bэтнос\w*\b",
 ]
 
 # Контекстные ключи для field_name и окна вокруг числа.
@@ -256,10 +285,17 @@ def mask_value(category: str, value: str) -> str:
     if category == "MRZ":
         return v[:5] + "..." + v[-2:] if len(v) > 10 else "***"
     if category == "FIO":
+        # Маска вида "И.(6) П.(7) С.(9)": первая буква + длина основы в
+        # скобках. Это нужно, чтобы отличать реальные токены ("Борис" = 5
+        # букв) от одиночных инициалов ("Б." - 1 буква), иначе отчёт
+        # визуально теряет разницу после маскировки.
         parts = [p for p in re.split(r"\s+", v) if p]
         masked = []
         for p in parts:
-            masked.append(p[:1] + "." if p else "")
+            core = p.rstrip(".")
+            if not core:
+                continue
+            masked.append(f"{core[:1]}.({len(core)})")
         return " ".join(masked) or "***"
     if category == "ADDRESS":
         return (v[:6] + "...") if len(v) > 6 else "***"
@@ -397,8 +433,45 @@ class PIIDetector:
 
     @staticmethod
     def _text_has_keyword(text: str, keywords: List[str]) -> bool:
+        """Для контекстных подсказок (паспорт/ИНН/CVV/дата рождения) -
+        быстрый подстрочный матч в уже lowercased окне."""
         low = text.lower()
         return any(k in low for k in keywords)
+
+    @staticmethod
+    def _text_matches_any_regex(text: str, patterns: List[str]) -> bool:
+        """Для словарных категорий (HEALTH/BIOMETRIC/...) - матч с
+        учётом word boundaries. re.IGNORECASE, т.к. тексты русскоязычные."""
+        for p in patterns:
+            if re.search(p, text, flags=re.IGNORECASE | re.UNICODE):
+                return True
+        return False
+
+    # Форма "похоже на ФИО": 2-5 токенов, каждый - либо инициал (одна
+    # заглавная буква с точкой или без), либо слово на кириллице/латинице
+    # с ОДНОЙ заглавной первой буквой и дальше только строчными. Цифры
+    # и внутренние заглавные (iPhone, S20) запрещены - это надёжно
+    # отрезает товарные и технические названия, но допускает "Michael
+    # Roman" / "Иванов Иван" и "Иван Петрович Сергеев-Кузнецов".
+    # Нужен как value-gate к field_name: "product_name" подстрочно
+    # содержит "name", но "Смартфон Samsung Galaxy S20" - не ФИО.
+    _FIO_TOKEN_RE = re.compile(r"^([А-ЯЁA-Z]\.?|[А-ЯЁA-Z][а-яёa-z\-]+)$")
+
+    @classmethod
+    def _looks_like_fio(cls, value: str) -> bool:
+        v = (value or "").strip()
+        if not v or len(v) < 3 or len(v) > 120:
+            return False
+        tokens = [t for t in re.split(r"\s+", v) if t]
+        if not (2 <= len(tokens) <= 5):
+            return False
+        meaningful = 0
+        for t in tokens:
+            if not cls._FIO_TOKEN_RE.match(t):
+                return False
+            if len(t.rstrip(".")) >= 2:
+                meaningful += 1
+        return meaningful >= 1
 
     @staticmethod
     def _window_around(text: str, start: int, end: int, pad: int = 40) -> str:
@@ -482,11 +555,25 @@ class PIIDetector:
             cat = "INN_PERSONAL" if len(re.sub(r"\D", "", val)) == 12 else "INN_LEGAL"
             self._add_finding(bucket, cat, val, chunk)
 
-        # --- BANK_CARD: Luhn ---
+        # --- BANK_CARD: Luhn + контекст ---
+        # Luhn на 13-19 цифрах сам по себе даёт ~10% ложных срабатываний
+        # (IMEI, GTIN, ISBN-13, номера патентов). Требуем контекст:
+        # field_name указывает на карту, ИЛИ рядом слова "карт/card/pan/
+        # visa/masterc/mir" в окне 60 символов.
         for m in PATTERNS["BANK_CARD_CAND"].finditer(text):
             val = m.group(0)
-            if luhn_valid(val):
-                self._add_finding(bucket, "BANK_CARD", val, chunk)
+            if not luhn_valid(val):
+                continue
+            ctx_ok = (
+                self._field_has(fn, FIELD_HINTS_CARD)
+                or self._text_has_keyword(
+                    self._window_around(text, m.start(), m.end(), pad=60),
+                    ["карт", "card", "pan", "visa", "masterc", "мир"],
+                )
+            )
+            if not ctx_ok:
+                continue
+            self._add_finding(bucket, "BANK_CARD", val, chunk)
 
         # --- BANK_ACCOUNT: 20 цифр, контекст ---
         for m in PATTERNS["BANK_ACCOUNT_CAND"].finditer(text):
@@ -539,18 +626,21 @@ class PIIDetector:
         if self._field_has(fn, FIELD_HINTS_ADDRESS):
             self._add_finding(bucket, "ADDRESS", text, chunk)
 
-        # --- FIO: если field_name однозначно "фамилия/имя/фио" ---
-        if self._field_has(fn, FIELD_HINTS_FIO):
+        # --- FIO: field_name + value-gate по форме русскоязычного ФИО ---
+        # Без value-gate "product_name" матчится по подстроке "name" и
+        # каждая строка продукта получает ложный FIO finding. Проверено
+        # на products.csv (320 FP).
+        if self._field_has(fn, FIELD_HINTS_FIO) and self._looks_like_fio(text):
             self._add_finding(bucket, "FIO", text, chunk)
 
-        # --- Словарные: биометрия и спец. категории ---
-        if self._text_has_keyword(text, KEYWORDS_BIOMETRIC):
+        # --- Словарные: биометрия и спец. категории (word boundaries) ---
+        if self._text_matches_any_regex(text, KEYWORDS_BIOMETRIC):
             self._add_finding(bucket, "BIOMETRIC_MENTION", text[:120], chunk)
-        if self._text_has_keyword(text, KEYWORDS_HEALTH):
+        if self._text_matches_any_regex(text, KEYWORDS_HEALTH):
             self._add_finding(bucket, "HEALTH", text[:120], chunk)
-        if self._text_has_keyword(text, KEYWORDS_RELIGION_POLITICS):
+        if self._text_matches_any_regex(text, KEYWORDS_RELIGION_POLITICS):
             self._add_finding(bucket, "RELIGION_POLITICS", text[:120], chunk)
-        if self._text_has_keyword(text, KEYWORDS_RACE_NATIONALITY):
+        if self._text_matches_any_regex(text, KEYWORDS_RACE_NATIONALITY):
             self._add_finding(bucket, "RACE_NATIONALITY", text[:120], chunk)
 
     # ------------------------- Natasha NER pass -----------------------------
@@ -585,8 +675,13 @@ class PIIDetector:
         if not pieces:
             return
         combined = "".join(buf)
-        if len(combined) > 500_000:
-            combined = combined[:500_000]  # защитный лимит
+        # Защитный лимит: Natasha + morph tagger на больших PDF - основной
+        # bottleneck прогона (full scan 2795 файлов: ~16 мин). Текст сверх
+        # лимита отбрасывается - ФИО в "хвосте" больших документов могут
+        # быть не найдены. Значение подобрано как компромисс между охватом
+        # и производительностью. Можно настраивать через инжект в класс.
+        if len(combined) > 300_000:
+            combined = combined[:300_000]
 
         Doc = nat["Doc"]
         doc = Doc(combined)
@@ -610,22 +705,70 @@ class PIIDetector:
             value = (span.normal or span.text or "").strip()
             if not value or len(value) < 3:
                 continue
+            # Отсекаем одиночные инициалы и "мусорные" спаны без
+            # полноценного слова (минимум 2 буквы). Проверено на полном
+            # прогоне: Natasha массово выдавала "Н.", "П.", "И.И." как
+            # самостоятельные спаны - это формально PER, но бесполезно.
+            tokens = [t for t in re.split(r"\s+", value) if t]
+            meaningful = [t for t in tokens if len(t.rstrip(".")) >= 2]
+            if not meaningful:
+                continue
             ch = chunk_for(span.start)
             if ch is None:
                 continue
             self._add_finding(bucket, "FIO", value, ch)
 
     # ------------------------- УЗ (уровень защищённости) --------------------
-    def _compute_uz(self, group_counts: Dict[str, int]) -> Optional[int]:
+    # По 152-ФЗ + ПП 1119 УЗ-1 применяется когда СПЕЦИАЛЬНЫЕ категории
+    # ОБРАБАТЫВАЮТСЯ относительно конкретного субъекта, а не просто
+    # упоминаются в тексте (например, в научной статье или патенте).
+    #
+    # Сигналы "обработки конкретного субъекта" (достаточно одного):
+    #   Только строгий персональный идентификатор - СНИЛС, паспорт РФ,
+    #   ИНН физлица, ВУ, MRZ, дата рождения. Ранее сюда также входил
+    #   порог ФИО (>=5), но он даёт ложные УЗ-1 на шумных источниках:
+    #   публичные блог-страницы с заголовками постов, где Natasha
+    #   находит десятки "ФИО" среди псевдонимов/героев, а одно случайное
+    #   упоминание "диагноз" или "национальность" вытягивает документ
+    #   в высшую категорию защищённости. Без жёсткого идентификатора мы
+    #   не можем утверждать, что идёт обработка конкретного субъекта,
+    #   поэтому максимальный УЗ привязываем только к таким признакам.
+    _PERSONAL_IDENTIFIER_CATEGORIES = {
+        "SNILS", "PASSPORT_RF", "INN_PERSONAL",
+        "DRIVER_LICENSE", "MRZ", "BIRTH_DATE",
+    }
+
+    def _compute_uz(
+        self,
+        group_counts: Dict[str, int],
+        findings_by_category: Dict[str, List[Finding]],
+    ) -> Optional[int]:
         total = sum(group_counts.values())
         if total == 0:
             return None
-        if group_counts.get(GROUP_SPECIAL, 0) > 0 or group_counts.get(GROUP_BIOMETRIC, 0) > 0:
+
+        has_strict_pid = any(
+            cat in findings_by_category
+            for cat in self._PERSONAL_IDENTIFIER_CATEGORIES
+        )
+
+        has_special = group_counts.get(GROUP_SPECIAL, 0) > 0
+        has_biometric = group_counts.get(GROUP_BIOMETRIC, 0) > 0
+
+        # УЗ-1: спец/био + жёсткий идентификатор конкретного субъекта.
+        if (has_special or has_biometric) and has_strict_pid:
             return 1
+
         if group_counts.get(GROUP_PAYMENT, 0) > 0:
             return 2
         if group_counts.get(GROUP_STATE_IDS, 0) >= self.big_volume_threshold:
             return 2
+
+        # Чувствительный контент без subject-context (упоминание в общем
+        # смысле): УЗ-3 - повышенная категория, но не максимум.
+        if has_special or has_biometric:
+            return 3
+
         if group_counts.get(GROUP_STATE_IDS, 0) > 0:
             return 3
         if group_counts.get(GROUP_REGULAR, 0) >= self.big_volume_threshold:
@@ -634,7 +777,12 @@ class PIIDetector:
 
     # ------------------------- public API -----------------------------------
     def detect(self, file_result) -> FileClassification:
-        """Классификация одного файла (принимает FileProcessingResult)."""
+        """Классификация одного файла (принимает FileProcessingResult).
+
+        Режим "batch": все чанки уже материализованы в file_result.chunks.
+        Подходит для документов/изображений, где чанков мало (десятки-сотни).
+        Для крупных структурированных источников используйте detect_stream.
+        """
         chunks: List[TextChunk] = list(getattr(file_result, "chunks", []) or [])
         bucket: Dict[Tuple[str, str], Finding] = {}
 
@@ -645,22 +793,50 @@ class PIIDetector:
         if any(not ch.field_name and (ch.text or "").strip() for ch in chunks):
             self._detect_fio_with_natasha(chunks, bucket)
 
+        return self._finalize(bucket, file_result)
+
+    def detect_stream(
+        self,
+        file_meta,
+        chunks: Iterable[TextChunk],
+    ) -> FileClassification:
+        """Потоковая классификация.
+
+        Принимает метаданные (FileProcessingResult без chunks) и итератор
+        чанков. Предназначено для структурированных источников на 100k+
+        записей - чанки обрабатываются по одному без материализации.
+
+        Natasha NER в этом режиме НЕ запускается: все чанки структурных
+        форматов имеют field_name, а Natasha и так такие чанки пропускает.
+        Для .ipynb (смешанный формат) на неструктурированных чанках NER
+        можно включить отдельно, если понадобится.
+        """
+        bucket: Dict[Tuple[str, str], Finding] = {}
+        for ch in chunks:
+            self._detect_in_chunk(ch, bucket)
+        return self._finalize(bucket, file_meta)
+
+    def _finalize(
+        self,
+        bucket: Dict[Tuple[str, str], Finding],
+        file_meta,
+    ) -> FileClassification:
         findings_by_category: Dict[str, List[Finding]] = defaultdict(list)
         group_counts: Dict[str, int] = defaultdict(int)
         for f in bucket.values():
             findings_by_category[f.category].append(f)
             group_counts[f.group] += 1
 
-        path = str(getattr(file_result, "path", ""))
+        path = str(getattr(file_meta, "path", ""))
         return FileClassification(
             path=path,
             filename=Path(path).name if path else "",
-            format=str(getattr(file_result, "extension", "")),
-            via_ocr=bool(getattr(file_result, "via_ocr", False)),
+            format=str(getattr(file_meta, "extension", "")),
+            via_ocr=bool(getattr(file_meta, "via_ocr", False)),
             total_findings=sum(group_counts.values()),
             findings_by_category=dict(findings_by_category),
             findings_by_group=dict(group_counts),
-            uz_level=self._compute_uz(dict(group_counts)),
+            uz_level=self._compute_uz(dict(group_counts), dict(findings_by_category)),
         )
 
 

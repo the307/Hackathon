@@ -24,6 +24,7 @@ from typing import Callable, Dict, List, Optional
 
 from document_handlers import DOCUMENT_EXTRACTORS, TextChunk
 from image_processor import IMAGE_EXTRACTORS
+from structured_handlers import STRUCTURED_EXTRACTORS
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +62,10 @@ class FileProcessingResult:
     file_size_bytes: int = 0
     via_ocr: bool = False
     notes: List[str] = field(default_factory=list)
+    # Потоковый режим для structured-источников с большим числом записей.
+    # Если стоит True, run_scan вызовет detect_stream с лениво построенным
+    # итератором, а не detect(); chunks сам отчёт не содержит.
+    streaming: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +91,7 @@ def handle_markdown(path: Path, result: FileProcessingResult) -> FileProcessingR
 
 # --- Веб-контент ---
 def handle_html(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _stub(result, "extract visible text via BeautifulSoup (lxml parser)")
+    return _run_document_extractor(path, result)
 
 
 # --- Документы (реальная реализация) ---
@@ -153,22 +158,56 @@ def handle_xlsx(path: Path, result: FileProcessingResult) -> FileProcessingResul
     return _run_document_extractor(path, result)
 
 
-# --- Структурированные данные ---
+# --- Структурированные данные (потоковый режим) ---
+# Для structured-источников с десятками тысяч записей (physical.parquet
+# на 84k строк, subscribers.csv на 96k строк) материализация всех чанков
+# в result.chunks дала бы десятки МБ данных на файл и стала бы узким местом.
+# Вместо этого мы:
+#   1) помечаем result.streaming=True,
+#   2) запоминаем file_size для решения об УЗ ("большие объёмы"),
+#   3) детектор позже вызывает STRUCTURED_EXTRACTORS[ext](path) как генератор
+#      и процессит чанки лениво через detect_stream().
+def _prepare_streaming(path: Path, result: FileProcessingResult) -> FileProcessingResult:
+    try:
+        result.file_size_bytes = path.stat().st_size
+    except OSError:
+        result.file_size_bytes = 0
+    if not path.exists():
+        result.status = "error"
+        result.error = "file not found"
+        return result
+    if result.extension not in STRUCTURED_EXTRACTORS:
+        result.status = "skipped"
+        result.notes.append(f"no structured extractor for .{result.extension}")
+        return result
+    # Проверяем доступность опциональных зависимостей заранее, чтобы не
+    # писать красиво "ok" для файлов, которые потом всё равно не прочтутся.
+    if result.extension == "parquet":
+        try:
+            import pyarrow  # noqa: F401
+        except ImportError:
+            result.status = "skipped"
+            result.notes.append("parquet requires pyarrow; run `pip install pyarrow`")
+            return result
+    result.streaming = True
+    result.status = "ok"
+    return result
+
+
 def handle_csv(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _stub(result, "stream rows via csv.DictReader or pandas chunksize; detect encoding/delimiter")
+    return _prepare_streaming(path, result)
 
 
 def handle_json(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _stub(result, "parse JSON; iterate values recursively; collect strings for scanning")
+    return _prepare_streaming(path, result)
 
 
 def handle_ipynb(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    # .ipynb — это JSON; текст живёт в cells[*].source и cells[*].outputs[*].text
-    return _stub(result, "parse as JSON notebook; collect cells' source/outputs text")
+    return _prepare_streaming(path, result)
 
 
 def handle_parquet(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _stub(result, "read via pyarrow/pandas in row groups; iterate string columns")
+    return _prepare_streaming(path, result)
 
 
 # --- Изображения (OCR через pytesseract) ---
@@ -234,6 +273,11 @@ HandlerFn = Callable[[Path, FileProcessingResult], FileProcessingResult]
 IMPLEMENTED_EXTENSIONS: set[str] = {
     # документы
     "pdf", "docx", "doc", "rtf", "xls", "xlsx",
+    # веб (HTML-экстрактор + авто-маршрутизация для .pdf, которые
+    # физически являются HTML - таких ~1/3 .pdf в нашем датасете).
+    "html", "htm",
+    # структурированные (потоковый режим)
+    "csv", "json", "parquet", "ipynb",
     # изображения (OCR)
     "jpg", "jpeg", "png", "gif", "tif", "tiff", "bmp",
 }
@@ -381,10 +425,34 @@ def run_scan(
     detector = PIIDetector()
     classifications_by_path: Dict[str, object] = {}
     for i, res in enumerate(extracted, start=1):
-        if res.status != "ok" or not res.chunks:
+        if res.status != "ok":
             continue
         try:
-            cls = detector.detect(res)
+            if res.streaming:
+                # Потоковый режим: лениво строим итератор чанков и
+                # одновременно считаем метрики (chunks_count, chars_count)
+                # по ходу прогона.
+                extractor = STRUCTURED_EXTRACTORS[res.extension]
+
+                def _counting(iterator, _r=res):
+                    for ch in iterator:
+                        _r.chunks_count += 1
+                        _r.chars_count += len(ch.text)
+                        yield ch
+
+                try:
+                    cls = detector.detect_stream(res, _counting(extractor(Path(res.path))))
+                except Exception as exc:
+                    res.notes.append(f"stream error: {type(exc).__name__}: {exc}")
+                    continue
+                if res.chunks_count == 0:
+                    res.status = "skipped"
+                    res.notes.append("no records extracted (empty or unreadable structured file)")
+                    continue
+            elif not res.chunks:
+                continue
+            else:
+                cls = detector.detect(res)
             classifications_by_path[res.path] = cls
         except Exception as exc:
             res.notes.append(f"classify error: {type(exc).__name__}: {exc}")
@@ -432,7 +500,7 @@ def _main(argv: List[str]) -> int:
     )
     parser.add_argument(
         "target",
-        help="путь к каталогу (сканирование) или к файлу (диагностический прогон)",
+        help="C:\\Users\\xxxxb\\PycharmProjects\\PythonProject13\\ПДнDataset",
     )
     parser.add_argument(
         "--out", "-o", default="reports",

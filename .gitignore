@@ -12,3 +12,7 @@ build/
 
 # generated scan reports
 reports/
+
+# user dataset (contains sensitive data, must not go to git)
+ПДнDataset/
+

@@ -374,13 +374,96 @@ def extract_xlsx(path: Path) -> Iterator[TextChunk]:
 
 
 # ---------------------------------------------------------------------------
+# HTML: реальный handler. Частый кейс в нашем датасете - файлы с
+# расширением .pdf, но реальным содержимым HTML (видно в логе прогона:
+# "invalid pdf header: b'<!DOC'"). Проверено: 911 из 1658 .pdf оказались
+# такими. Чтобы не терять треть датасета, имеем:
+#   1) сам HTML handler (для честных .html / .htm);
+#   2) sniff в extract_pdf: если файл начинается не с %PDF-, пытаемся
+#      обработать как HTML.
+# ---------------------------------------------------------------------------
+def extract_html(path: Path) -> Iterator[TextChunk]:
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return iter(())
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return iter(())
+
+    text = _decode_bytes(raw)
+    if not text:
+        return iter(())
+
+    # "lxml" быстрее, но требует доп. пакет; html.parser всегда доступен.
+    try:
+        soup = BeautifulSoup(text, "lxml")
+    except Exception:
+        soup = BeautifulSoup(text, "html.parser")
+
+    # Убираем script/style, они не несут ПДн и шумят при NER.
+    for bad in soup(["script", "style", "noscript"]):
+        bad.decompose()
+
+    def _gen() -> Iterator[TextChunk]:
+        title_tag = soup.find("title")
+        if title_tag and title_tag.get_text(strip=True):
+            yield TextChunk(
+                text=title_tag.get_text(strip=True),
+                source=f"{path.name}#title",
+                field_name="title",
+                meta={"tag": "title"},
+            )
+        # Основной текст: один чанк на документ, без field_name. Детальнее
+        # резать по тегам не требуется - детектор сам агрегирует по файлу.
+        body_text = soup.get_text(separator="\n", strip=True)
+        if body_text:
+            yield TextChunk(
+                text=body_text,
+                source=f"{path.name}#body",
+                field_name=None,
+                meta={"tag": "body"},
+            )
+    return _gen()
+
+
+def _is_real_pdf(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(5)
+        return head == b"%PDF-"
+    except OSError:
+        return False
+
+
+def extract_pdf_or_html(path: Path) -> Iterator[TextChunk]:
+    """Умная диспетчеризация для .pdf: если файл в реальности HTML -
+    используем HTML-экстрактор, иначе обычный PDF."""
+    if _is_real_pdf(path):
+        return extract_pdf(path)
+    # не PDF - проверяем, не HTML ли это
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512).lstrip().lower()
+    except OSError:
+        return iter(())
+    if head.startswith(b"<!doc") or head.startswith(b"<html") or b"<html" in head[:256]:
+        return extract_html(path)
+    # неизвестный бинарь с расширением .pdf - возвращаем пустоту
+    return iter(())
+
+
+# ---------------------------------------------------------------------------
 # Удобная карта: расширение -> экстрактор (использует main.py).
 # ---------------------------------------------------------------------------
 DOCUMENT_EXTRACTORS = {
-    "pdf":  extract_pdf,
+    "pdf":  extract_pdf_or_html,
     "docx": extract_docx,
     "doc":  extract_doc,
     "rtf":  extract_rtf,
     "xls":  extract_xls,
     "xlsx": extract_xlsx,
+    "html": extract_html,
+    "htm":  extract_html,
 }
