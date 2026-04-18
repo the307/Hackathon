@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+.idea/
+model_artifacts/
+ПДнDataset/
+
+result.csv
+sample_*.csv
+single_*.csv
+single_*.json
