@@ -11,3 +11,13 @@ openpyxl>=3.1.0
 # image_processor.py. Без бинарника handler корректно пропускает файлы.
 pytesseract>=0.3.10
 Pillow>=10.0.0
+
+# PII detection
+# natasha - русский NLP, NER для ФИО/LOC/ORG (https://github.com/natasha/natasha)
+# При первом импорте подтянет модели (~20 MB).
+natasha>=1.6.0
+# setuptools нужен явно: natasha.MorphVocab -> pymorphy2.analyzer импортит
+# pkg_resources, который живёт в setuptools. С setuptools>=81 модуль
+# pkg_resources удалён из дистрибутива, поэтому пин <81. Без этой строки
+# Natasha молча отключается (NER не запускается, FIO не находится).
+setuptools>=68.0.0,<81
