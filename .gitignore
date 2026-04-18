@@ -9,3 +9,6 @@ __pycache__/
 .eggs/
 dist/
 build/
+
+# generated scan reports
+reports/

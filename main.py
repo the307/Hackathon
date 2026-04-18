@@ -227,6 +227,17 @@ def handle_unknown(path: Path, result: FileProcessingResult) -> FileProcessingRe
 # ---------------------------------------------------------------------------
 HandlerFn = Callable[[Path, FileProcessingResult], FileProcessingResult]
 
+# Расширения, для которых уже есть РЕАЛЬНЫЙ обработчик (не stub).
+# На этапе сканирования каталога мы включаем в отчёт только их - это явное
+# требование пользователя: "по тем файлам для которых мы пока написали
+# обработчик".
+IMPLEMENTED_EXTENSIONS: set[str] = {
+    # документы
+    "pdf", "docx", "doc", "rtf", "xls", "xlsx",
+    # изображения (OCR)
+    "jpg", "jpeg", "png", "gif", "tif", "tiff", "bmp",
+}
+
 EXTENSION_MAP: Dict[str, tuple[HandlerFn, str]] = {
     # text
     "txt":    (handle_txt,      "text"),
@@ -308,28 +319,168 @@ def process_file(file_path: str | Path) -> FileProcessingResult:
 
 
 # ---------------------------------------------------------------------------
-# Мини-CLI: позволяет проверить диспетчер на одном файле или нескольких.
-#   python main.py <file1> [file2 ...]
+# Сканирование каталога: обход + диспетчер + фильтр "только реализованные".
+# ---------------------------------------------------------------------------
+def scan_directory(
+    root: str | Path,
+    only_implemented: bool = True,
+):
+    """Рекурсивно обходит каталог и возвращает итератор FileProcessingResult.
+
+    Пропускает файлы, для которых обработчик ещё не реализован (stub),
+    чтобы не засорять отчёт записями с нулевыми чанками и пометкой TODO.
+    """
+    from typing import Iterator
+    root_path = Path(root)
+    if not root_path.exists():
+        return iter(())
+    if root_path.is_file():
+        return iter([process_file(root_path)])
+
+    def _gen() -> Iterator[FileProcessingResult]:
+        for p in root_path.rglob("*"):
+            if not p.is_file():
+                continue
+            ext = p.suffix.lower().lstrip(".")
+            if only_implemented and ext not in IMPLEMENTED_EXTENSIONS:
+                continue
+            yield process_file(p)
+    return _gen()
+
+
+# ---------------------------------------------------------------------------
+# Полный прогон: scan -> classify -> report.
+# ---------------------------------------------------------------------------
+def run_scan(
+    root: str | Path,
+    output_dir: str | Path = "reports",
+    report_stem: str = "pii_report",
+    only_implemented: bool = True,
+    progress: bool = True,
+) -> Dict[str, Path]:
+    """Выполняет полный цикл и пишет отчёт (JSON + CSV + Markdown).
+
+    Возвращает словарь путей к сгенерированным файлам отчёта.
+    """
+    from find_pd import PIIDetector
+    from report import build_report, write_all
+
+    root_path = Path(root)
+    out_dir = Path(output_dir)
+
+    extracted: List[FileProcessingResult] = []
+    # Первый проход: извлечение текста
+    for i, res in enumerate(scan_directory(root_path, only_implemented=only_implemented), start=1):
+        extracted.append(res)
+        if progress and i % 25 == 0:
+            print(f"  [extract] {i} files processed...", flush=True)
+    if progress:
+        print(f"  [extract] done, {len(extracted)} files", flush=True)
+
+    # Второй проход: классификация. Natasha загружается один раз.
+    detector = PIIDetector()
+    classifications_by_path: Dict[str, object] = {}
+    for i, res in enumerate(extracted, start=1):
+        if res.status != "ok" or not res.chunks:
+            continue
+        try:
+            cls = detector.detect(res)
+            classifications_by_path[res.path] = cls
+        except Exception as exc:
+            res.notes.append(f"classify error: {type(exc).__name__}: {exc}")
+        if progress and i % 25 == 0:
+            print(f"  [classify] {i}/{len(extracted)}...", flush=True)
+    if progress:
+        status = "ok" if detector.natasha_available() else f"OFF ({detector.natasha_error})"
+        print(f"  [classify] done, Natasha NER: {status}", flush=True)
+
+    # Отчёт
+    report = build_report(
+        extracted_results=extracted,
+        classifications_by_path=classifications_by_path,
+        root=str(root_path),
+    )
+    paths = write_all(report, out_dir, stem=report_stem)
+    if progress:
+        print("  [report] generated:")
+        for fmt, p in paths.items():
+            print(f"    {fmt:>4}: {p}")
+    return paths
+
+
+# ---------------------------------------------------------------------------
+# CLI:
+#   python main.py <folder>                 - полный прогон + отчёт
+#   python main.py <file>                   - разобрать один файл (диагностика)
+#   python main.py <folder> --out reports/  - указать папку отчёта
 # ---------------------------------------------------------------------------
 def _main(argv: List[str]) -> int:
+    import argparse
     import sys as _sys
     try:
         _sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-    if len(argv) < 2:
-        print("Usage: python main.py <file1> [file2 ...]")
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Сканирование файлового хранилища на ПДн по 152-ФЗ. "
+            "По умолчанию: рекурсивный обход -> извлечение текста -> "
+            "классификация (regex + валидаторы + Natasha NER) -> отчёт "
+            "(JSON + CSV + Markdown)."
+        )
+    )
+    parser.add_argument(
+        "target",
+        help="путь к каталогу (сканирование) или к файлу (диагностический прогон)",
+    )
+    parser.add_argument(
+        "--out", "-o", default="reports",
+        help="папка для отчёта (по умолчанию: ./reports)",
+    )
+    parser.add_argument(
+        "--name", default="pii_report",
+        help="имя файлов отчёта без расширения (по умолчанию: pii_report)",
+    )
+    parser.add_argument(
+        "--all-extensions", action="store_true",
+        help="включать в отчёт все файлы, даже с нереализованным обработчиком",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="не печатать прогресс",
+    )
+    args = parser.parse_args(argv[1:] if argv else None)
+
+    target = Path(args.target)
+    if not target.exists():
+        print(f"error: path not found: {target}")
         return 2
-    for p in argv[1:]:
-        res = process_file(p)
+
+    if target.is_file():
+        # Диагностический режим: один файл - просто показываем результат
+        res = process_file(target)
         print(
             f"[{res.status:>7}] ext={res.extension!r:>9} "
-            f"category={res.category:<10} handler={res.handler:<16} path={res.path}"
+            f"category={res.category:<10} handler={res.handler:<16} "
+            f"chunks={res.chunks_count} chars={res.chars_count} "
+            f"path={res.path}"
         )
         if res.error:
             print(f"          error: {res.error}")
         for note in res.notes:
             print(f"          note:  {note}")
+        return 0
+
+    # Каталог: полный прогон
+    print(f"Scanning: {target}")
+    run_scan(
+        root=target,
+        output_dir=args.out,
+        report_stem=args.name,
+        only_implemented=not args.all_extensions,
+        progress=not args.quiet,
+    )
     return 0
 
 
