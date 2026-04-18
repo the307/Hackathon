@@ -1,5 +1,13 @@
+# documents
 pypdf>=4.0.0
 python-docx>=1.1.0
 striprtf>=0.0.26
 xlrd>=2.0.1
 openpyxl>=3.1.0
+
+# images (OCR)
+# pytesseract - обёртка над системным Tesseract OCR. ТРЕБУЕТ отдельной
+# установки бинарника Tesseract + языковых данных (rus, eng) - см.
+# image_processor.py. Без бинарника handler корректно пропускает файлы.
+pytesseract>=0.3.10
+Pillow>=10.0.0

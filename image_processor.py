@@ -1,54 +1,129 @@
-import os
-from PIL import Image  # pip install Pillow
+"""
+Обработчик для категории 'image': JPG/JPEG/PNG/GIF/TIF/TIFF/BMP.
 
-def process_image_files(root_folder, valid_extensions=None):
-    """
-    Рекурсивно обходит папку root_folder и её подпапки,
-    открывает каждый найденный файл с заданными расширениями изображений.
+Контракт (общий с document_handlers.py):
+    extract_image(path: Path) -> Iterator[TextChunk]
 
-    :param root_folder: путь к корневой папке
-    :param valid_extensions: кортеж допустимых расширений (например, ('.tif', '.jpg')).
-                             Если None, используются расширения по умолчанию.
-    """
-    # Расширения по умолчанию, если не переданы явно
-    if valid_extensions is None:
-        valid_extensions = ('.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp', '.gif')
+Принципы:
+- OCR через pytesseract (обёртка над системным бинарником Tesseract).
+  Источник: https://github.com/madmaze/pytesseract
+- Многостраничные TIFF/GIF итерируются через PIL.ImageSequence
+  (yield по кадру - каждый кадр становится отдельным TextChunk c meta.page).
+- Перед OCR кадр переводится в градации серого ('L') - это повышает
+  качество распознавания, рекомендация Tesseract: https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html
+- meta.via_ocr=True - сигнал классификатору снижать уверенность
+  (OCR ошибается на сканах, размытии, рукописном тексте).
+- OCR - ОПЦИОНАЛЬНО по ТЗ. Если Tesseract не установлен или недоступен
+  нужный язык, extract_image() возвращает пустой генератор + диспетчер
+  запишет осмысленный status/note. Программа не падает.
 
-    # Приводим к нижнему регистру для корректного сравнения
-    valid_extensions = tuple(ext.lower() for ext in valid_extensions)
+Требования к окружению (для полноценной работы OCR):
+- pytesseract (pip install)
+- Pillow (pip install; уже транзитивная зависимость pytesseract)
+- Системный Tesseract OCR:
+    - Windows: https://github.com/UB-Mannheim/tesseract/wiki
+    - Linux: пакет 'tesseract-ocr' + 'tesseract-ocr-rus'
+- Языковые данные rus.traineddata + eng.traineddata в TESSDATA_PREFIX:
+    https://github.com/tesseract-ocr/tessdata
+"""
 
-    if not os.path.isdir(root_folder):
-        print(f"Ошибка: папка '{root_folder}' не найдена.")
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterator, List
+
+from document_handlers import TextChunk
+
+
+# ---------------------------------------------------------------------------
+# Проверка доступности Tesseract без исключений наружу.
+# ---------------------------------------------------------------------------
+def _tesseract_available() -> bool:
+    try:
+        import pytesseract  # noqa: F401
+    except ImportError:
+        return False
+    try:
+        import pytesseract
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+
+def _pick_languages(available: List[str]) -> str:
+    """Выбираем 'rus+eng' если оба установлены, иначе что есть, по умолчанию 'eng'."""
+    preferred = [lang for lang in ("rus", "eng") if lang in available]
+    if preferred:
+        return "+".join(preferred)
+    if available:
+        return available[0]
+    return "eng"
+
+
+# ---------------------------------------------------------------------------
+# Основной экстрактор.
+# ---------------------------------------------------------------------------
+def extract_image(path: Path) -> Iterator[TextChunk]:
+    try:
+        import pytesseract
+        from PIL import Image, ImageSequence, UnidentifiedImageError
+    except ImportError:
+        # Библиотеки не установлены - деликатно выходим. Диспетчер поставит note.
         return
 
-    # os.walk генерирует пути ко всем файлам во всех подпапках
-    for dirpath, dirnames, filenames in os.walk(root_folder):
-        for filename in filenames:
-            # Проверяем расширение (регистронезависимо)
-            if filename.lower().endswith(valid_extensions):
-                file_path = os.path.join(dirpath, filename)
-                print(f"Открываю: {file_path}")
+    if not _tesseract_available():
+        return
 
-                try:
-                    # Открываем изображение с помощью Pillow
-                    with Image.open(file_path) as img:
-                        # ==================================================
-                        # ===   ВСТАВЬТЕ СВОЙ КОД ОБРАБОТКИ СЮДА   ===========
-                        # ==================================================
-                        # Например:
-                        # width, height = img.size
-                        # print(f"Размер изображения: {width} x {height}")
-                        pass
-                        # ==================================================
-                except Exception as e:
-                    print(f"Не удалось обработать {file_path}: {e}")
+    try:
+        available_langs = list(pytesseract.get_languages(config=""))
+    except Exception:
+        available_langs = ["eng"]
+    languages = _pick_languages(available_langs)
 
-if __name__ == "__main__":
-    # Укажите здесь путь к вашей папке X
-    folder_X = r"D:\ПДнDataset\share\Выгрузки\Сайты"
+    try:
+        img_ctx = Image.open(str(path))
+    except (UnidentifiedImageError, OSError, ValueError):
+        return
 
-    # Пример 1: использовать расширения по умолчанию (tif, jpg, png и т.д.)
-    process_image_files(folder_X)
+    with img_ctx as img:
+        frames_iter = ImageSequence.Iterator(img)
+        page_idx = 0
+        for frame in frames_iter:
+            page_idx += 1
+            try:
+                ocr_frame = frame.convert("L")
+                text = pytesseract.image_to_string(ocr_frame, lang=languages)
+            except Exception:
+                continue
 
-    # Пример 2: передать только нужные расширения
-    # process_image_files(folder_X, valid_extensions=('.tif', '.jpeg', '.png'))
+            if not text or not text.strip():
+                continue
+
+            yield TextChunk(
+                text=text,
+                source=f"{path.name}#page={page_idx}",
+                meta={
+                    "page": page_idx,
+                    "via_ocr": True,
+                    "ocr_lang": languages,
+                    "width": getattr(frame, "width", None),
+                    "height": getattr(frame, "height", None),
+                },
+            )
+
+
+# ---------------------------------------------------------------------------
+# Карта: расширение -> экстрактор (использует main.py).
+# Покрывает все расширения-изображения из датасета (.jpg, .png, .tif, .gif)
+# плюс родственные (.jpeg, .tiff, .bmp) - общее требование ТЗ.
+# ---------------------------------------------------------------------------
+IMAGE_EXTRACTORS = {
+    "jpg":  extract_image,
+    "jpeg": extract_image,
+    "png":  extract_image,
+    "gif":  extract_image,
+    "tif":  extract_image,
+    "tiff": extract_image,
+    "bmp":  extract_image,
+}

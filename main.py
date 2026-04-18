@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from document_handlers import DOCUMENT_EXTRACTORS, TextChunk
+from image_processor import IMAGE_EXTRACTORS
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +90,7 @@ def handle_html(path: Path, result: FileProcessingResult) -> FileProcessingResul
 
 
 # --- Документы (реальная реализация) ---
-# Документные экстракторы отдают поток TextChunk. Здесь мы собираем
+# Документные экстракторы отдают поток TextChunk. Собираем
 # всё в result.extracted_text, чтобы следующий слой (детектор ПДн) мог
 # получить готовый текст. Для больших файлов в продакшене этот join
 # заменится на прямую потоковую передачу чанков в детектор.
@@ -170,9 +171,40 @@ def handle_parquet(path: Path, result: FileProcessingResult) -> FileProcessingRe
     return _stub(result, "read via pyarrow/pandas in row groups; iterate string columns")
 
 
-# --- Изображения (OCR при необходимости) ---
+# --- Изображения (OCR через pytesseract) ---
+# Отдельная обёртка, потому что image-путь задаёт via_ocr=True
+# и формулирует более конкретную note, когда OCR недоступен.
+def _run_image_extractor(path: Path, result: FileProcessingResult) -> FileProcessingResult:
+    extractor = IMAGE_EXTRACTORS[result.extension]
+    parts: List[str] = []
+    chunks: List[TextChunk] = []
+    chars = 0
+    for chunk in extractor(path):
+        chunks.append(chunk)
+        chars += len(chunk.text)
+        parts.append(chunk.text)
+
+    result.chunks = chunks
+    result.chunks_count = len(chunks)
+    result.chars_count = chars
+    result.extracted_text = "\n".join(parts) if parts else ""
+    result.via_ocr = True  # категория image - текст в любом случае "через OCR"
+
+    try:
+        result.file_size_bytes = path.stat().st_size
+    except OSError:
+        result.file_size_bytes = 0
+
+    if not chunks:
+        result.status = "skipped"
+        result.notes.append(
+            "no text extracted - Tesseract OCR not available or image has no readable text"
+        )
+    return result
+
+
 def handle_image(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _stub(result, "optional OCR via Tesseract/EasyOCR (rus+eng); skip if OCR disabled")
+    return _run_image_extractor(path, result)
 
 
 # --- Видео ---
@@ -227,6 +259,7 @@ EXTENSION_MAP: Dict[str, tuple[HandlerFn, str]] = {
     "gif":    (handle_image,    "image"),
     "tif":    (handle_image,    "image"),
     "tiff":   (handle_image,    "image"),
+    "bmp":    (handle_image,    "image"),
 
     # video
     "mp4":    (handle_video,    "video"),
