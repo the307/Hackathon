@@ -1,18 +1,13 @@
-.venv/
-.idea/
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-*.egg-info/
-.eggs/
-dist/
-build/
+.pytest_cache/
+.venv/
 
-# generated scan reports
-reports/
-
-# user dataset (contains sensitive data, must not go to git)
+.idea/
+model_artifacts/
 ПДнDataset/
 
+result.csv
+sample_*.csv
+single_*.csv
+single_*.json

@@ -1,557 +1,143 @@
-"""
-Диспетчер обработки файлов для поиска персональных данных (ПДн).
-
-Шаг 1 (этот файл):
-- Определяем формат входного файла по расширению.
-- Вызываем соответствующую функцию-обработчик (handler) для этого формата.
-- Все handler'ы — заглушки (stubs), которые возвращают унифицированный результат
-  и будут реализованы на следующих шагах (извлечение текста, OCR и т.д.).
-
-Поддерживаемые расширения выбраны по двум источникам:
-1) Список из ТЗ хакатона (CSV, JSON, Parquet, PDF, DOC, DOCX, RTF, XLS,
-   HTML, TIF, JPEG, PNG, GIF, MP4).
-2) Реальные расширения, найденные в датасете
-   C:\\Users\\xxxxb\\OneDrive\\Desktop\\ПДнDataset (проверено Get-ChildItem):
-   .pdf, .jpg, .html, .tif, .png, .docx, .xls, .rtf, .doc, .csv, .txt,
-   .gif, .json, .ipynb, .md, .parquet, .mp4, а также файлы без расширения.
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import argparse
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
 
-from document_handlers import DOCUMENT_EXTRACTORS, TextChunk
-from image_processor import IMAGE_EXTRACTORS
-from structured_handlers import STRUCTURED_EXTRACTORS
+from models import DEFAULT_EXTENSIONS, ScanConfig
+from reporting import write_report
+from scanner import scan_root
 
+DEFAULT_DATASET_ROOT = Path(__file__).resolve().parent / "ПДнDataset" / "share"
 
-# ---------------------------------------------------------------------------
-# Унифицированный результат обработки одного файла.
-# На следующих шагах сюда добавятся: извлечённый текст (или его часть),
-# найденные категории ПДн, количество находок, рассчитанный УЗ и т.д.
-# ---------------------------------------------------------------------------
-@dataclass
-class FileProcessingResult:
-    """Результат обработки одного файла - вход для классификатора ПДн.
 
-    Что именно получает классификатор и зачем:
-      - extracted_text   - сырой текст для регулярок/словарей/NER.
-      - chunks           - список TextChunk со structured-координатами
-                           (page/row/col/sheet/row_id/field_name). Нужен
-                           для точной локализации находок в отчёте и для
-                           агрегации "кластеров ПДн" по одной строке.
-      - file_size_bytes  - нужен для решения про УЗ ("большие объёмы" по ТЗ).
-      - chunks_count, chars_count - метрики объёма данных (тоже сигнал для УЗ).
-      - via_ocr          - True, когда текст получен через OCR (для image/video
-                           на следующих шагах). Влияет на уверенность детектора.
-      - notes            - служебные пометки обработки (warnings и т.п.).
-      - status/error     - контракт обработки ошибок по ТЗ.
-    """
-    path: str
-    extension: str          # расширение в нижнем регистре, без точки ("pdf", "csv", ...)
-    category: str           # крупная группа: "document" / "structured" / "image" / "video" / "web" / "text" / "unknown"
-    handler: str            # имя вызванного handler'а
-    status: str = "ok"      # "ok" | "skipped" | "error"
-    error: Optional[str] = None
-    extracted_text: Optional[str] = None
-    chunks: List[TextChunk] = field(default_factory=list)
-    chunks_count: int = 0
-    chars_count: int = 0
-    file_size_bytes: int = 0
-    via_ocr: bool = False
-    notes: List[str] = field(default_factory=list)
-    # Потоковый режим для structured-источников с большим числом записей.
-    # Если стоит True, run_scan вызовет detect_stream с лениво построенным
-    # итератором, а не detect(); chunks сам отчёт не содержит.
-    streaming: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Handler'ы по форматам.
-# Сейчас это СТАБЫ: они только фиксируют, что файл распознан и какой handler
-# должен быть вызван. Реализацию извлечения текста добавим следующим шагом,
-# чтобы не смешивать два этапа.
-# ---------------------------------------------------------------------------
-
-def _stub(result: FileProcessingResult, todo: str) -> FileProcessingResult:
-    result.notes.append(f"TODO: {todo}")
-    return result
-
-
-# --- Текст ---
-def handle_txt(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _stub(result, "read as utf-8/cp1251 with fallback and return text")
-
-
-def handle_markdown(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _stub(result, "read markdown as plain text (optionally strip markdown syntax)")
-
-
-# --- Веб-контент ---
-def handle_html(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _run_document_extractor(path, result)
-
-
-# --- Документы (реальная реализация) ---
-# Документные экстракторы отдают поток TextChunk. Собираем
-# всё в result.extracted_text, чтобы следующий слой (детектор ПДн) мог
-# получить готовый текст. Для больших файлов в продакшене этот join
-# заменится на прямую потоковую передачу чанков в детектор.
-def _run_document_extractor(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    extractor = DOCUMENT_EXTRACTORS[result.extension]
-    parts: List[str] = []
-    chunks: List[TextChunk] = []
-    chars = 0
-    for chunk in extractor(path):
-        chunks.append(chunk)
-        chars += len(chunk.text)
-        parts.append(chunk.text)
-
-    result.chunks = chunks
-    result.chunks_count = len(chunks)
-    result.chars_count = chars
-    result.extracted_text = "\n".join(parts) if parts else ""
-
-    try:
-        result.file_size_bytes = path.stat().st_size
-    except OSError:
-        result.file_size_bytes = 0
-
-    if not chunks:
-        result.status = "skipped"
-        if result.extension == "doc":
-            result.notes.append(
-                "no text extracted - .doc requires LibreOffice 'soffice' in PATH"
-            )
-        elif result.extension == "pdf":
-            result.notes.append(
-                "no text extracted - likely a scanned PDF; OCR handler will be needed"
-            )
-        else:
-            result.notes.append("no text extracted (empty or unsupported content)")
-    return result
-
-
-def handle_pdf(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _run_document_extractor(path, result)
-
-
-def handle_docx(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _run_document_extractor(path, result)
-
-
-def handle_doc(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _run_document_extractor(path, result)
-
-
-def handle_rtf(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _run_document_extractor(path, result)
-
-
-def handle_xls(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _run_document_extractor(path, result)
-
-
-def handle_xlsx(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _run_document_extractor(path, result)
-
-
-# --- Структурированные данные (потоковый режим) ---
-# Для structured-источников с десятками тысяч записей (physical.parquet
-# на 84k строк, subscribers.csv на 96k строк) материализация всех чанков
-# в result.chunks дала бы десятки МБ данных на файл и стала бы узким местом.
-# Вместо этого мы:
-#   1) помечаем result.streaming=True,
-#   2) запоминаем file_size для решения об УЗ ("большие объёмы"),
-#   3) детектор позже вызывает STRUCTURED_EXTRACTORS[ext](path) как генератор
-#      и процессит чанки лениво через detect_stream().
-def _prepare_streaming(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    try:
-        result.file_size_bytes = path.stat().st_size
-    except OSError:
-        result.file_size_bytes = 0
-    if not path.exists():
-        result.status = "error"
-        result.error = "file not found"
-        return result
-    if result.extension not in STRUCTURED_EXTRACTORS:
-        result.status = "skipped"
-        result.notes.append(f"no structured extractor for .{result.extension}")
-        return result
-    # Проверяем доступность опциональных зависимостей заранее, чтобы не
-    # писать красиво "ok" для файлов, которые потом всё равно не прочтутся.
-    if result.extension == "parquet":
-        try:
-            import pyarrow  # noqa: F401
-        except ImportError:
-            result.status = "skipped"
-            result.notes.append("parquet requires pyarrow; run `pip install pyarrow`")
-            return result
-    result.streaming = True
-    result.status = "ok"
-    return result
-
-
-def handle_csv(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _prepare_streaming(path, result)
-
-
-def handle_json(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _prepare_streaming(path, result)
-
-
-def handle_ipynb(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _prepare_streaming(path, result)
-
-
-def handle_parquet(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _prepare_streaming(path, result)
-
-
-# --- Изображения (OCR через pytesseract) ---
-# Отдельная обёртка, потому что image-путь задаёт via_ocr=True
-# и формулирует более конкретную note, когда OCR недоступен.
-def _run_image_extractor(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    extractor = IMAGE_EXTRACTORS[result.extension]
-    parts: List[str] = []
-    chunks: List[TextChunk] = []
-    chars = 0
-    for chunk in extractor(path):
-        chunks.append(chunk)
-        chars += len(chunk.text)
-        parts.append(chunk.text)
-
-    result.chunks = chunks
-    result.chunks_count = len(chunks)
-    result.chars_count = chars
-    result.extracted_text = "\n".join(parts) if parts else ""
-    result.via_ocr = True  # категория image - текст в любом случае "через OCR"
-
-    try:
-        result.file_size_bytes = path.stat().st_size
-    except OSError:
-        result.file_size_bytes = 0
-
-    if not chunks:
-        result.status = "skipped"
-        result.notes.append(
-            "no text extracted - Tesseract OCR not available or image has no readable text"
-        )
-    return result
-
-
-def handle_image(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _run_image_extractor(path, result)
-
-
-# --- Видео ---
-def handle_video(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    return _stub(result, "extract keyframes via ffmpeg and run OCR on them (optional, heavy)")
-
-
-# --- Неизвестный/без расширения ---
-def handle_unknown(path: Path, result: FileProcessingResult) -> FileProcessingResult:
-    result.status = "skipped"
-    result.notes.append(
-        "unknown extension — later: sniff via 'filetype'/'python-magic' and retry dispatch"
-    )
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Карта: расширение (без точки, в нижнем регистре) -> (handler, category)
-# Расширения покрывают и ТЗ, и то, что реально встречено в датасете.
-# ---------------------------------------------------------------------------
-HandlerFn = Callable[[Path, FileProcessingResult], FileProcessingResult]
-
-# Расширения, для которых уже есть РЕАЛЬНЫЙ обработчик (не stub).
-# На этапе сканирования каталога мы включаем в отчёт только их - это явное
-# требование пользователя: "по тем файлам для которых мы пока написали
-# обработчик".
-IMPLEMENTED_EXTENSIONS: set[str] = {
-    # документы
-    "pdf", "docx", "doc", "rtf", "xls", "xlsx",
-    # веб (HTML-экстрактор + авто-маршрутизация для .pdf, которые
-    # физически являются HTML - таких ~1/3 .pdf в нашем датасете).
-    "html", "htm",
-    # структурированные (потоковый режим)
-    "csv", "json", "parquet", "ipynb",
-    # изображения (OCR)
-    "jpg", "jpeg", "png", "gif", "tif", "tiff", "bmp",
-}
-
-EXTENSION_MAP: Dict[str, tuple[HandlerFn, str]] = {
-    # text
-    "txt":    (handle_txt,      "text"),
-    "md":     (handle_markdown, "text"),
-
-    # web
-    "html":   (handle_html,     "web"),
-    "htm":    (handle_html,     "web"),
-
-    # documents
-    "pdf":    (handle_pdf,      "document"),
-    "docx":   (handle_docx,     "document"),
-    "doc":    (handle_doc,      "document"),
-    "rtf":    (handle_rtf,      "document"),
-
-    # excel
-    "xls":    (handle_xls,      "document"),
-    "xlsx":   (handle_xlsx,     "document"),
-
-    # structured
-    "csv":     (handle_csv,     "structured"),
-    "json":    (handle_json,    "structured"),
-    "ipynb":   (handle_ipynb,   "structured"),
-    "parquet": (handle_parquet, "structured"),
-
-    # images
-    "jpg":    (handle_image,    "image"),
-    "jpeg":   (handle_image,    "image"),
-    "png":    (handle_image,    "image"),
-    "gif":    (handle_image,    "image"),
-    "tif":    (handle_image,    "image"),
-    "tiff":   (handle_image,    "image"),
-    "bmp":    (handle_image,    "image"),
-
-    # video
-    "mp4":    (handle_video,    "video"),
-}
-
-
-# ---------------------------------------------------------------------------
-# Основная функция-диспетчер.
-# ---------------------------------------------------------------------------
-def process_file(file_path: str | Path) -> FileProcessingResult:
-    """Определить формат файла по расширению и вызвать нужный handler.
-
-    Возвращает FileProcessingResult со статусом обработки и пометками TODO
-    от handler'ов (до полной реализации извлечения текста).
-    """
-    path = Path(file_path)
-    ext = path.suffix.lower().lstrip(".")  # "" для файлов без расширения
-
-    result = FileProcessingResult(
-        path=str(path),
-        extension=ext,
-        category="unknown",
-        handler="handle_unknown",
-    )
-
-    if not path.exists():
-        result.status = "error"
-        result.error = "file not found"
-        return result
-
-    if not path.is_file():
-        result.status = "error"
-        result.error = "not a regular file"
-        return result
-
-    handler, category = EXTENSION_MAP.get(ext, (handle_unknown, "unknown"))
-    result.category = category
-    result.handler = handler.__name__
-
-    try:
-        return handler(path, result)
-    except Exception as exc:
-        result.status = "error"
-        result.error = f"{type(exc).__name__}: {exc}"
-        return result
-
-
-# ---------------------------------------------------------------------------
-# Сканирование каталога: обход + диспетчер + фильтр "только реализованные".
-# ---------------------------------------------------------------------------
-def scan_directory(
-    root: str | Path,
-    only_implemented: bool = True,
-):
-    """Рекурсивно обходит каталог и возвращает итератор FileProcessingResult.
-
-    Пропускает файлы, для которых обработчик ещё не реализован (stub),
-    чтобы не засорять отчёт записями с нулевыми чанками и пометкой TODO.
-    """
-    from typing import Iterator
-    root_path = Path(root)
-    if not root_path.exists():
-        return iter(())
-    if root_path.is_file():
-        return iter([process_file(root_path)])
-
-    def _gen() -> Iterator[FileProcessingResult]:
-        for p in root_path.rglob("*"):
-            if not p.is_file():
-                continue
-            ext = p.suffix.lower().lstrip(".")
-            if only_implemented and ext not in IMPLEMENTED_EXTENSIONS:
-                continue
-            yield process_file(p)
-    return _gen()
-
-
-# ---------------------------------------------------------------------------
-# Полный прогон: scan -> classify -> report.
-# ---------------------------------------------------------------------------
-def run_scan(
-    root: str | Path,
-    output_dir: str | Path = "reports",
-    report_stem: str = "pii_report",
-    only_implemented: bool = True,
-    progress: bool = True,
-) -> Dict[str, Path]:
-    """Выполняет полный цикл и пишет отчёт (JSON + CSV + Markdown).
-
-    Возвращает словарь путей к сгенерированным файлам отчёта.
-    """
-    from find_pd import PIIDetector
-    from report import build_report, write_all
-
-    root_path = Path(root)
-    out_dir = Path(output_dir)
-
-    extracted: List[FileProcessingResult] = []
-    # Первый проход: извлечение текста
-    for i, res in enumerate(scan_directory(root_path, only_implemented=only_implemented), start=1):
-        extracted.append(res)
-        if progress and i % 25 == 0:
-            print(f"  [extract] {i} files processed...", flush=True)
-    if progress:
-        print(f"  [extract] done, {len(extracted)} files", flush=True)
-
-    # Второй проход: классификация. Natasha загружается один раз.
-    detector = PIIDetector()
-    classifications_by_path: Dict[str, object] = {}
-    for i, res in enumerate(extracted, start=1):
-        if res.status != "ok":
-            continue
-        try:
-            if res.streaming:
-                # Потоковый режим: лениво строим итератор чанков и
-                # одновременно считаем метрики (chunks_count, chars_count)
-                # по ходу прогона.
-                extractor = STRUCTURED_EXTRACTORS[res.extension]
-
-                def _counting(iterator, _r=res):
-                    for ch in iterator:
-                        _r.chunks_count += 1
-                        _r.chars_count += len(ch.text)
-                        yield ch
-
-                try:
-                    cls = detector.detect_stream(res, _counting(extractor(Path(res.path))))
-                except Exception as exc:
-                    res.notes.append(f"stream error: {type(exc).__name__}: {exc}")
-                    continue
-                if res.chunks_count == 0:
-                    res.status = "skipped"
-                    res.notes.append("no records extracted (empty or unreadable structured file)")
-                    continue
-            elif not res.chunks:
-                continue
-            else:
-                cls = detector.detect(res)
-            classifications_by_path[res.path] = cls
-        except Exception as exc:
-            res.notes.append(f"classify error: {type(exc).__name__}: {exc}")
-        if progress and i % 25 == 0:
-            print(f"  [classify] {i}/{len(extracted)}...", flush=True)
-    if progress:
-        status = "ok" if detector.natasha_available() else f"OFF ({detector.natasha_error})"
-        print(f"  [classify] done, Natasha NER: {status}", flush=True)
-
-    # Отчёт
-    report = build_report(
-        extracted_results=extracted,
-        classifications_by_path=classifications_by_path,
-        root=str(root_path),
-    )
-    paths = write_all(report, out_dir, stem=report_stem)
-    if progress:
-        print("  [report] generated:")
-        for fmt, p in paths.items():
-            print(f"    {fmt:>4}: {p}")
-    return paths
-
-
-# ---------------------------------------------------------------------------
-# CLI:
-#   python main.py <folder>                 - полный прогон + отчёт
-#   python main.py <file>                   - разобрать один файл (диагностика)
-#   python main.py <folder> --out reports/  - указать папку отчёта
-# ---------------------------------------------------------------------------
-def _main(argv: List[str]) -> int:
-    import argparse
-    import sys as _sys
-    try:
-        _sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Сканирование файлового хранилища на ПДн по 152-ФЗ. "
-            "По умолчанию: рекурсивный обход -> извлечение текста -> "
-            "классификация (regex + валидаторы + Natasha NER) -> отчёт "
-            "(JSON + CSV + Markdown)."
-        )
+        description="CLI-сканер для поиска персональных данных в файловом хранилище."
     )
     parser.add_argument(
-        "target",
-        help="C:\\Users\\xxxxb\\PycharmProjects\\PythonProject13\\ПДнDataset",
+        "root",
+        nargs="?",
+        default=str(DEFAULT_DATASET_ROOT),
+        help=(
+            "Корневая директория или одиночный файл для анализа. "
+            f"По умолчанию: {DEFAULT_DATASET_ROOT}"
+        ),
     )
     parser.add_argument(
-        "--out", "-o", default="reports",
-        help="папка для отчёта (по умолчанию: ./reports)",
+        "-o",
+        "--output",
+        default="result.csv",
+        help="Путь к итоговому отчету. Для хакатона CSV должен иметь вид size,time,name.",
     )
     parser.add_argument(
-        "--name", default="pii_report",
-        help="имя файлов отчёта без расширения (по умолчанию: pii_report)",
+        "--output-format",
+        choices=("csv", "json", "md"),
+        default="csv",
+        help="Формат отчета.",
     )
     parser.add_argument(
-        "--all-extensions", action="store_true",
-        help="включать в отчёт все файлы, даже с нереализованным обработчиком",
+        "--include-ext",
+        nargs="*",
+        default=sorted(DEFAULT_EXTENSIONS),
+        help="Список расширений для анализа без точки.",
     )
     parser.add_argument(
-        "--quiet", action="store_true",
-        help="не печатать прогресс",
+        "--max-text-chars",
+        type=int,
+        default=200_000,
+        help="Лимит символов на один файл после извлечения.",
     )
-    args = parser.parse_args(argv[1:] if argv else None)
+    parser.add_argument(
+        "--max-structured-rows",
+        type=int,
+        default=20_000,
+        help="Лимит строк/элементов для CSV и JSON.",
+    )
+    parser.add_argument(
+        "--max-binary-read-bytes",
+        type=int,
+        default=5_000_000,
+        help="Сколько байт читать в binary fallback для тяжелых файлов.",
+    )
+    parser.add_argument(
+        "--enable-ocr",
+        action="store_true",
+        help="Попытаться использовать OCR для изображений, если pillow и pytesseract доступны.",
+    )
+    parser.add_argument(
+        "--include-empty-results",
+        action="store_true",
+        help="Включать в отчет файлы без найденных признаков ПДн.",
+    )
+    parser.add_argument(
+        "--analysis-workers",
+        type=int,
+        default=3,
+        help="Количество параллельных веток анализа текста одного документа.",
+    )
+    parser.add_argument(
+        "--file-workers",
+        type=int,
+        default=1,
+        help="Сколько файлов обрабатывать параллельно (>=2 включает file-level параллелизм).",
+    )
+    parser.add_argument(
+        "--warmup-model",
+        action="store_true",
+        help="Прогреть модельный классификатор до начала сканирования.",
+    )
+    parser.add_argument(
+        "--debug-progress",
+        action="store_true",
+        help="Печатать для каждого файла его расширение и время обработки.",
+    )
+    return parser
 
-    target = Path(args.target)
-    if not target.exists():
-        print(f"error: path not found: {target}")
-        return 2
 
-    if target.is_file():
-        # Диагностический режим: один файл - просто показываем результат
-        res = process_file(target)
-        print(
-            f"[{res.status:>7}] ext={res.extension!r:>9} "
-            f"category={res.category:<10} handler={res.handler:<16} "
-            f"chunks={res.chunks_count} chars={res.chars_count} "
-            f"path={res.path}"
-        )
-        if res.error:
-            print(f"          error: {res.error}")
-        for note in res.notes:
-            print(f"          note:  {note}")
-        return 0
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
 
-    # Каталог: полный прогон
-    print(f"Scanning: {target}")
-    run_scan(
-        root=target,
-        output_dir=args.out,
-        report_stem=args.name,
-        only_implemented=not args.all_extensions,
-        progress=not args.quiet,
+    config = ScanConfig(
+        root=Path(args.root).expanduser().resolve(),
+        output=Path(args.output).expanduser().resolve(),
+        output_format=args.output_format,
+        include_extensions={extension.lower().lstrip(".") for extension in args.include_ext},
+        max_text_chars=args.max_text_chars,
+        max_structured_rows=args.max_structured_rows,
+        max_binary_read_bytes=args.max_binary_read_bytes,
+        enable_ocr=args.enable_ocr,
+        include_empty_results=args.include_empty_results,
+        analysis_workers=args.analysis_workers,
+        file_workers=args.file_workers,
+        debug_progress=args.debug_progress,
     )
+
+    if not config.root.exists():
+        parser.error(f"Путь не найден: {config.root}")
+
+    if args.warmup_model:
+        try:
+            from analysis.model_special_classifier import _load_model_bundle
+
+            _load_model_bundle()
+        except Exception:
+            pass
+        try:
+            from analysis import natasha_ner
+
+            natasha_ner.warmup()
+        except Exception:
+            pass
+
+    results = scan_root(config)
+    config.output.parent.mkdir(parents=True, exist_ok=True)
+    write_report(results, config.output, config.output_format)
+
+    print(f"Сканирование завершено. Результатов: {len(results)}")
+    print(f"Отчет сохранен: {config.output}")
     return 0
 
 
 if __name__ == "__main__":
-    import sys
-    raise SystemExit(_main(sys.argv))
+    raise SystemExit(main())
