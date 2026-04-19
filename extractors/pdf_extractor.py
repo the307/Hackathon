@@ -25,7 +25,7 @@ _OCR_DPI = 200
 _OCR_SAMPLE_RATIO = 5
 _OCR_SAMPLE_MIN = 2
 _OCR_SAMPLE_MAX = 6
-_OCR_FULL_PAGE_LIMIT = 30
+_OCR_FULL_PAGE_LIMIT = 15
 _OCR_MIN_MEANINGFUL_PER_PAGE = 30
 
 
@@ -112,15 +112,14 @@ def _ocr_language_variants() -> tuple[str, ...]:
         available = set(PYTESSERACT.get_languages(config=""))
     except Exception:
         return ("eng",)
-    variants: list[str] = []
-    if "rus" in available:
-        variants.append("rus")
     combined = "+".join(lang for lang in ("rus", "eng") if lang in available)
-    if combined and combined not in variants:
-        variants.append(combined)
-    if not variants:
-        variants.append(next(iter(available)) if available else "eng")
-    return tuple(variants)
+    if combined:
+        return (combined,)
+    if "rus" in available:
+        return ("rus",)
+    if available:
+        return (next(iter(available)),)
+    return ("eng",)
 
 
 def _has_meaningful_text(text: str) -> bool:

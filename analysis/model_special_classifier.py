@@ -107,10 +107,12 @@ def _load_model_bundle():
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR))
         model = AutoModelForSequenceClassification.from_pretrained(str(MODEL_DIR))
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
     except Exception:
         return None
     model.eval()
-    return torch, tokenizer, model
+    return torch, tokenizer, model, device
 
 
 def _select_relevant_chunks(chunks: list[str], max_chunks: int) -> list[str]:
@@ -135,7 +137,7 @@ def predict_special_labels(text: str, threshold: float = DEFAULT_THRESHOLD, max_
     if bundle is None:
         return {}
 
-    torch, tokenizer, model = bundle
+    torch, tokenizer, model, device = bundle
     chunks = split_text_for_classification(text)
     if not chunks:
         return {}
@@ -152,6 +154,7 @@ def predict_special_labels(text: str, threshold: float = DEFAULT_THRESHOLD, max_
             max_length=384,
             return_tensors="pt",
         )
+        encoded = {key: value.to(device) for key, value in encoded.items()}
         outputs = model(**encoded)
         logits = outputs.logits
         probs = torch.sigmoid(logits)
