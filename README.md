@@ -119,7 +119,6 @@ size,time,name
 python -m pip install pypdf PyPDF2 pdfminer.six python-docx beautifulsoup4 xlrd openpyxl striprtf pillow pytesseract easyocr
 ```
 
-Я не могу подтвердить установку этих библиотек в текущем окружении автоматически через `pip`, потому что попытка установки завершилась ошибкой доступа к индексу пакетов.
 
 ## План проверки
 
