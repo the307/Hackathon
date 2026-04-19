@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,8 @@ from models import ScanConfig, ScanResult
 
 
 MONTH_ABBR = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+_PROGRESS_STEP = 50
+_PROGRESS_BAR_WIDTH = 24
 
 
 def discover_files(root: Path, include_extensions: set[str]) -> Iterable[Path]:
@@ -97,10 +100,33 @@ def _process_path(path: Path, config: ScanConfig) -> tuple[Path, float, str, Sca
         return path, perf_counter() - started, "failed", None
 
 
+def _write_slow_log(config: ScanConfig, rows: list[tuple[str, str, float, str]]) -> None:
+    target = getattr(config, "slow_log_path", None)
+    if target is None:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["path", "ext", "seconds", "status"])
+        for path, ext, seconds, status in rows:
+            writer.writerow([path, ext, f"{seconds:.3f}", status])
+
+
+def _print_progress(completed: int, total: int) -> None:
+    if total <= 0:
+        return
+    ratio = min(1.0, max(0.0, completed / total))
+    filled = int(round(ratio * _PROGRESS_BAR_WIDTH))
+    bar = "#" * filled + "-" * (_PROGRESS_BAR_WIDTH - filled)
+    print(f"[progress] [{bar}] {completed}/{total} ({ratio * 100:.1f}%)")
+
+
 def scan_root(config: ScanConfig) -> list[ScanResult]:
     paths = list(discover_files(config.root, config.include_extensions))
     total_files = len(paths)
     results: list[ScanResult] = []
+    slow_rows: list[tuple[str, str, float, str]] = []
+    slow_threshold = max(0.0, getattr(config, "slow_threshold_seconds", 20.0))
 
     workers = max(1, getattr(config, "file_workers", 1))
     if workers <= 1 or total_files <= 1:
@@ -109,11 +135,16 @@ def scan_root(config: ScanConfig) -> list[ScanResult]:
             extension = path.suffix.lower().lstrip(".") or "unknown"
             if config.debug_progress:
                 print(f"[debug] {index}/{total_files} {extension} {elapsed:.3f}s {path.name} {status}")
+            if elapsed >= slow_threshold:
+                slow_rows.append((str(path), extension, elapsed, status))
             if result is not None:
                 if result.findings_count > 0 or config.include_empty_results:
                     results.append(result)
             elif config.include_empty_results:
                 results.append(_empty_result(path))
+            if config.debug_progress and (index % _PROGRESS_STEP == 0 or index == total_files):
+                _print_progress(index, total_files)
+        _write_slow_log(config, slow_rows)
         return results
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -125,9 +156,14 @@ def scan_root(config: ScanConfig) -> list[ScanResult]:
             extension = path.suffix.lower().lstrip(".") or "unknown"
             if config.debug_progress:
                 print(f"[debug] {completed}/{total_files} {extension} {elapsed:.3f}s {path.name} {status}")
+            if elapsed >= slow_threshold:
+                slow_rows.append((str(path), extension, elapsed, status))
             if result is not None:
                 if result.findings_count > 0 or config.include_empty_results:
                     results.append(result)
             elif config.include_empty_results:
                 results.append(_empty_result(path))
+            if config.debug_progress and (completed % _PROGRESS_STEP == 0 or completed == total_files):
+                _print_progress(completed, total_files)
+    _write_slow_log(config, slow_rows)
     return results

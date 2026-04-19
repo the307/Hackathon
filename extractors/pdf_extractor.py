@@ -15,6 +15,8 @@ PYPDF2 = safe_import("PyPDF2")
 PDFMINER = safe_import("pdfminer")
 PDF2IMAGE = safe_import("pdf2image")
 PYTESSERACT = safe_import("pytesseract")
+EASYOCR = safe_import("easyocr")
+NUMPY = safe_import("numpy")
 
 _MEANINGFUL_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]")
 _CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
@@ -190,6 +192,10 @@ def _select_sample_pages(page_count: int) -> list[int]:
 
 
 def _ocr_page(path: Path, page_number: int, poppler_path: str | None) -> str:
+    easyocr_text = _ocr_page_easyocr(path, page_number, poppler_path)
+    if easyocr_text and len(_MEANINGFUL_RE.findall(easyocr_text)) >= _OCR_MIN_MEANINGFUL_PER_PAGE:
+        return easyocr_text
+
     if PDF2IMAGE is None or PYTESSERACT is None:
         return ""
     try:
@@ -235,6 +241,52 @@ def _resolve_poppler_path() -> str | None:
     if os.path.isdir(_DEFAULT_POPPLER_BIN):
         return _DEFAULT_POPPLER_BIN
     return None
+
+
+@lru_cache(maxsize=1)
+def _easyocr_reader():
+    if EASYOCR is None:
+        return None
+    try:
+        import torch
+
+        gpu = bool(torch.cuda.is_available())
+    except Exception:
+        gpu = False
+    try:
+        return EASYOCR.Reader(["ru", "en"], gpu=gpu, verbose=False)
+    except Exception:
+        return None
+
+
+def _ocr_page_easyocr(path: Path, page_number: int, poppler_path: str | None) -> str:
+    if PDF2IMAGE is None or EASYOCR is None or NUMPY is None:
+        return ""
+    reader = _easyocr_reader()
+    if reader is None:
+        return ""
+    try:
+        from pdf2image import convert_from_path
+
+        kwargs = {
+            "dpi": _OCR_DPI,
+            "first_page": page_number,
+            "last_page": page_number,
+        }
+        if poppler_path:
+            kwargs["poppler_path"] = poppler_path
+        images = convert_from_path(str(path), **kwargs)
+    except Exception:
+        return ""
+    if not images:
+        return ""
+    try:
+        lines = reader.readtext(NUMPY.array(images[0]), detail=0, paragraph=True)
+    except Exception:
+        return ""
+    if not lines:
+        return ""
+    return _normalize_mixed_script("\n".join(str(line) for line in lines if str(line).strip()))
 
 
 def _ocr_scanned_pdf(path: Path, page_count: int) -> tuple[str, list[str]]:

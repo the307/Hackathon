@@ -41,6 +41,8 @@ class ScanConfig:
     analysis_workers: int = 3
     file_workers: int = 1
     debug_progress: bool = False
+    slow_log_path: Path | None = None
+    slow_threshold_seconds: float = 20.0
 
 
 @dataclass(slots=True)

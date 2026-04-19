@@ -91,6 +91,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Печатать для каждого файла его расширение и время обработки.",
     )
+    parser.add_argument(
+        "--slow-log",
+        default="",
+        help="CSV-файл для медленных файлов (по умолчанию: рядом с output как slow_files.csv).",
+    )
+    parser.add_argument(
+        "--slow-threshold",
+        type=float,
+        default=20.0,
+        help="Порог (сек) для попадания файла в slow-log.",
+    )
     return parser
 
 
@@ -98,9 +109,16 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    output_path = Path(args.output).expanduser().resolve()
+    slow_log_path = (
+        Path(args.slow_log).expanduser().resolve()
+        if args.slow_log
+        else output_path.parent / "slow_files.csv"
+    )
+
     config = ScanConfig(
         root=Path(args.root).expanduser().resolve(),
-        output=Path(args.output).expanduser().resolve(),
+        output=output_path,
         output_format=args.output_format,
         include_extensions={extension.lower().lstrip(".") for extension in args.include_ext},
         max_text_chars=args.max_text_chars,
@@ -111,6 +129,8 @@ def main() -> int:
         analysis_workers=args.analysis_workers,
         file_workers=args.file_workers,
         debug_progress=args.debug_progress,
+        slow_log_path=slow_log_path,
+        slow_threshold_seconds=max(0.0, args.slow_threshold),
     )
 
     if not config.root.exists():
