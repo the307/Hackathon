@@ -6,6 +6,7 @@ from typing import Dict, List
 
 
 DEFAULT_EXTENSIONS = {
+    "bmp",
     "csv",
     "doc",
     "docx",
@@ -38,6 +39,8 @@ class ScanConfig:
     enable_ocr: bool = False
     include_empty_results: bool = False
     analysis_workers: int = 3
+    file_workers: int = 1
+    debug_progress: bool = False
 
 
 @dataclass(slots=True)

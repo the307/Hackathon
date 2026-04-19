@@ -18,6 +18,7 @@ from .spreadsheet_extractor import extract_xls
 
 
 EXTRACTORS: dict[str, Callable[[Path, ScanConfig], ExtractedContent]] = {
+    "bmp": extract_image,
     "csv": extract_csv,
     "doc": extract_binary_strings,
     "docx": extract_docx,

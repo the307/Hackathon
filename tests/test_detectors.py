@@ -84,6 +84,27 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(categories["обычные"], 0)
         self.assertEqual(categories["биометрические"], 0)
 
+    def test_demo_markers_suppress_findings(self):
+        valid_snils = make_valid_snils("112233445")
+        text = (
+            "Пример заявления (образец, для тестирования). "
+            f"СНИЛС: {valid_snils}, телефон: +7 910 245-63-18, "
+            "email: ivanov@example.com"
+        )
+        categories = detect_categories(text)
+        self.assertEqual(categories["государственные"], 0)
+        self.assertEqual(categories["обычные"], 0)
+
+    def test_duplicate_values_counted_once(self):
+        text = (
+            "Контакты сотрудника: телефон +7 910 245-63-18, e-mail ivanov@corp.ru. "
+            "Дублирующая строка ниже:\n"
+            "телефон +7 910 245-63-18, e-mail ivanov@corp.ru.\n"
+            "телефон +7 910 245-63-18."
+        )
+        categories = detect_categories(text)
+        self.assertEqual(categories["обычные"], 2)
+
     def test_generic_role_emails_do_not_count_as_personal_contacts(self):
         categories = detect_categories(
             "Advertising: livejournal@sberseller.ru Promotion: bloggers@livejournalinc.com PR: pr@ramber-co.ru"

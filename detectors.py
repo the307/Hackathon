@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 import re
 from collections import Counter
-from typing import Dict, Iterable
+from functools import lru_cache
+from typing import Dict, Iterable, Set, Tuple
 
 
 CATEGORY_ORDER = (
@@ -17,6 +18,7 @@ CATEGORY_ORDER = (
 EMAIL_RE = re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}\b")
 PHONE_RE = re.compile(r"(?:(?:\+7|8)\s*\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2})")
 FIO_RE = re.compile(r"\b[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2}\b")
+FIO_LATIN_RE = re.compile(r"\b[A-Z][a-z]{1,}(?:\s+[A-Z][a-z]{1,}){1,2}\b")
 DOB_RE = re.compile(r"\b\d{2}[./]\d{2}[./]\d{4}\b")
 BIRTH_PLACE_RE = re.compile(r"(?i)(место\s+рождени[яи]|родил[а-я]+\s+в|урожен[еца][кц]?)")
 ADDRESS_CONTEXT_RE = re.compile(
@@ -48,6 +50,14 @@ PERSON_CONTEXT_KEYWORDS = (
     "подписал",
     "работник",
     "пациент",
+    "employee",
+    "candidate",
+    "applicant",
+    "patient",
+    "full name",
+    "first name",
+    "last name",
+    "surname",
 )
 PERSON_EXCLUDE_TOKENS = {
     "главная",
@@ -79,14 +89,38 @@ PERSON_EXCLUDE_TOKENS = {
     "петербург",
     "москва",
 }
-PHONE_CONTEXT_KEYWORDS = ("тел", "моб", "звонить", "контакт", "связ", "номер")
-EMAIL_CONTEXT_KEYWORDS = ("почта", "e-mail", "email", "ящик", "корпоратив")
-BIRTH_CONTEXT_KEYWORDS = ("дата рождения", "г. рождения", "родился", "родилась", "др", "возраст")
-BIRTH_EXCLUDE_KEYWORDS = ("дата выдачи", "срок действия", "выдан", "действителен")
-PASSPORT_CONTEXT_KEYWORDS = ("паспорт", "серия", "номер", "выдан", "кем")
-DRIVER_CONTEXT_KEYWORDS = ("ву", "права", "водительское", "категория")
-CARD_CONTEXT_KEYWORDS = ("карта", "visa", "mastercard", "mir", "мир", "cvc", "cvv", "срок действия")
-ACCOUNT_CONTEXT_KEYWORDS = ("р/с", "бик", "банк", "реквизиты", "платеж")
+PHONE_CONTEXT_KEYWORDS = (
+    "тел", "моб", "звонить", "контакт", "связ", "номер",
+    "phone", "mobile", "tel.", "contact",
+)
+EMAIL_CONTEXT_KEYWORDS = (
+    "почта", "e-mail", "email", "ящик", "корпоратив",
+    "mail", "inbox",
+)
+BIRTH_CONTEXT_KEYWORDS = (
+    "дата рождения", "г. рождения", "родился", "родилась", "др", "возраст",
+    "date of birth", "born on", "dob",
+)
+BIRTH_EXCLUDE_KEYWORDS = (
+    "дата выдачи", "срок действия", "выдан", "действителен",
+    "issued", "valid until", "expires",
+)
+PASSPORT_CONTEXT_KEYWORDS = (
+    "паспорт", "серия", "номер", "выдан", "кем",
+    "passport", "series", "issued by",
+)
+DRIVER_CONTEXT_KEYWORDS = (
+    "ву", "права", "водительское", "категория",
+    "driver license", "driving license",
+)
+CARD_CONTEXT_KEYWORDS = (
+    "карта", "visa", "mastercard", "mir", "мир", "cvc", "cvv", "срок действия",
+    "card number", "expires", "expiration",
+)
+ACCOUNT_CONTEXT_KEYWORDS = (
+    "р/с", "бик", "банк", "реквизиты", "платеж",
+    "account", "iban", "swift", "bank",
+)
 MRZ_CONTEXT_KEYWORDS = ("mrz", "passport", "машиносчитываемая зона")
 
 BIOMETRIC_KEYWORDS = (
@@ -114,6 +148,26 @@ SPECIAL_KEYWORDS = (
     "судимост",
 )
 
+DEMO_MARKER_KEYWORDS = (
+    "пример",
+    "образец",
+    "образца",
+    "образцом",
+    "тестов",
+    "test ",
+    "test:",
+    "test data",
+    "sample",
+    "demo",
+    "демо",
+    "синтет",
+    "вымышлен",
+    "учебн",
+    "fake",
+    "dummy",
+    "lorem ipsum",
+)
+
 GENERIC_EMAIL_LOCALPARTS = {
     "admin",
     "bloggers",
@@ -137,6 +191,7 @@ GENERIC_EMAIL_LOCALPARTS = {
 }
 
 
+@lru_cache(maxsize=8192)
 def luhn_check(number: str) -> bool:
     digits = [int(d) for d in re.sub(r"\D", "", number)]
     if len(digits) < 13:
@@ -152,6 +207,7 @@ def luhn_check(number: str) -> bool:
     return checksum % 10 == 0
 
 
+@lru_cache(maxsize=8192)
 def snils_valid(snils: str) -> bool:
     numbers = re.sub(r"\D", "", snils)
     if len(numbers) != 11:
@@ -170,6 +226,7 @@ def snils_valid(snils: str) -> bool:
     return checksum == expected
 
 
+@lru_cache(maxsize=8192)
 def inn_valid(inn: str) -> bool:
     numbers = re.sub(r"\D", "", inn)
     if len(numbers) == 10:
@@ -183,6 +240,32 @@ def inn_valid(inn: str) -> bool:
         check12 = sum(int(numbers[i]) * coeffs12[i] for i in range(11)) % 11 % 10
         return check11 == int(numbers[10]) and check12 == int(numbers[11])
     return False
+
+
+def _is_demo_context(lowered_text: str, start: int, end: int, radius: int = 200) -> bool:
+    fragment = lowered_text[max(0, start - radius) : min(len(lowered_text), end + radius)]
+    return any(keyword in fragment for keyword in DEMO_MARKER_KEYWORDS)
+
+
+def _normalize_phone(raw: str) -> str:
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits[0] in {"7", "8"}:
+        return "7" + digits[1:]
+    if len(digits) == 10:
+        return "7" + digits
+    return digits
+
+
+def _normalize_email(raw: str) -> str:
+    return raw.strip().lower()
+
+
+def _normalize_fio(raw: str) -> str:
+    return " ".join(token.lower() for token in raw.split())
+
+
+def _normalize_digits(raw: str) -> str:
+    return re.sub(r"\D", "", raw)
 
 
 def has_context(text: str, start: int, radius: int, *keywords: str) -> bool:
@@ -324,53 +407,149 @@ def detect_regex_categories(text: str) -> Dict[str, int]:
     lowered = normalized.lower()
     counts = Counter(empty_categories())
 
+    seen_emails: Set[str] = set()
+    seen_phones: Set[str] = set()
+    seen_snils: Set[str] = set()
+    seen_inn: Set[str] = set()
+    seen_passport: Set[str] = set()
+    seen_dl: Set[str] = set()
+    seen_mrz: Set[str] = set()
+    seen_card: Set[str] = set()
+    seen_account: Set[str] = set()
+    seen_bik: Set[str] = set()
+    seen_cvv: Set[Tuple[str, int]] = set()
+
     for match in EMAIL_RE.finditer(normalized):
-        if _valid_email(match.group(0)):
-            fragment = surrounding_fragment(lowered, match.start(), match.end())
-            if _looks_generic_email(match.group(0)):
-                continue
-            if any(keyword in fragment for keyword in EMAIL_CONTEXT_KEYWORDS) or "@" in match.group(0):
-                counts["обычные"] += 1
+        raw = match.group(0)
+        if not _valid_email(raw) or _looks_generic_email(raw):
+            continue
+        if _is_demo_context(lowered, match.start(), match.end()):
+            continue
+        fragment = surrounding_fragment(lowered, match.start(), match.end())
+        if not (any(keyword in fragment for keyword in EMAIL_CONTEXT_KEYWORDS) or "@" in raw):
+            continue
+        key = _normalize_email(raw)
+        if key in seen_emails:
+            continue
+        seen_emails.add(key)
+        counts["обычные"] += 1
 
     for match in PHONE_RE.finditer(normalized):
-        if _valid_phone(match.group(0)):
-            fragment = surrounding_fragment(lowered, match.start(), match.end())
-            if any(keyword in fragment for keyword in PHONE_CONTEXT_KEYWORDS) or match.group(0).startswith(("+7", "8")):
-                counts["обычные"] += 1
+        raw = match.group(0)
+        if not _valid_phone(raw):
+            continue
+        if _is_demo_context(lowered, match.start(), match.end()):
+            continue
+        fragment = surrounding_fragment(lowered, match.start(), match.end())
+        if not (any(keyword in fragment for keyword in PHONE_CONTEXT_KEYWORDS) or raw.startswith(("+7", "8"))):
+            continue
+        key = _normalize_phone(raw)
+        if key in seen_phones:
+            continue
+        seen_phones.add(key)
+        counts["обычные"] += 1
 
     for match in SNILS_RE.finditer(normalized):
-        if snils_valid(match.group(0)):
-            counts["государственные"] += 1
+        if not snils_valid(match.group(0)):
+            continue
+        if _is_demo_context(lowered, match.start(), match.end()):
+            continue
+        key = _normalize_digits(match.group(0))
+        if key in seen_snils:
+            continue
+        seen_snils.add(key)
+        counts["государственные"] += 1
     for match in INN10_RE.finditer(normalized):
-        if inn_valid(match.group(0)):
-            counts["государственные"] += 1
+        if not inn_valid(match.group(0)):
+            continue
+        if _is_demo_context(lowered, match.start(), match.end()):
+            continue
+        key = match.group(0)
+        if key in seen_inn:
+            continue
+        seen_inn.add(key)
+        counts["государственные"] += 1
     for match in INN12_RE.finditer(normalized):
-        if inn_valid(match.group(0)):
-            counts["государственные"] += 1
+        if not inn_valid(match.group(0)):
+            continue
+        if _is_demo_context(lowered, match.start(), match.end()):
+            continue
+        key = match.group(0)
+        if key in seen_inn:
+            continue
+        seen_inn.add(key)
+        counts["государственные"] += 1
     for match in PASSPORT_RE.finditer(normalized):
-        if _valid_passport(match.group(0)) and has_context(lowered, match.start(), 50, *PASSPORT_CONTEXT_KEYWORDS):
-            counts["государственные"] += 1
+        if not (_valid_passport(match.group(0)) and has_context(lowered, match.start(), 50, *PASSPORT_CONTEXT_KEYWORDS)):
+            continue
+        if _is_demo_context(lowered, match.start(), match.end()):
+            continue
+        key = _normalize_digits(match.group(0))
+        if key in seen_passport:
+            continue
+        seen_passport.add(key)
+        counts["государственные"] += 1
     for match in DL_RE.finditer(normalized):
-        if has_context(lowered, match.start(), 50, *DRIVER_CONTEXT_KEYWORDS):
-            counts["государственные"] += 1
+        if not has_context(lowered, match.start(), 50, *DRIVER_CONTEXT_KEYWORDS):
+            continue
+        if _is_demo_context(lowered, match.start(), match.end()):
+            continue
+        key = match.group(0)
+        if key in seen_dl:
+            continue
+        seen_dl.add(key)
+        counts["государственные"] += 1
     for match in MRZ_RE.finditer(normalized):
-        if _valid_mrz(match.group(0)) and has_context(lowered, match.start(), 60, *MRZ_CONTEXT_KEYWORDS):
-            counts["государственные"] += 1
+        if not (_valid_mrz(match.group(0)) and has_context(lowered, match.start(), 60, *MRZ_CONTEXT_KEYWORDS)):
+            continue
+        key = match.group(0)
+        if key in seen_mrz:
+            continue
+        seen_mrz.add(key)
+        counts["государственные"] += 1
 
     for match in CARD_RE.finditer(normalized):
-        digits = re.sub(r"\D", "", match.group(0))
-        if 13 <= len(digits) <= 19 and luhn_check(digits) and _valid_card_bin(digits):
-            if has_context(lowered, match.start(), 50, *CARD_CONTEXT_KEYWORDS):
-                counts["платежные"] += 1
+        digits = _normalize_digits(match.group(0))
+        if not (13 <= len(digits) <= 19 and luhn_check(digits) and _valid_card_bin(digits)):
+            continue
+        if not has_context(lowered, match.start(), 50, *CARD_CONTEXT_KEYWORDS):
+            continue
+        if _is_demo_context(lowered, match.start(), match.end()):
+            continue
+        if digits in seen_card:
+            continue
+        seen_card.add(digits)
+        counts["платежные"] += 1
     for account in ACCOUNT_RE.finditer(normalized):
-        if has_context(lowered, account.start(), 60, *ACCOUNT_CONTEXT_KEYWORDS):
-            counts["платежные"] += 1
+        if not has_context(lowered, account.start(), 60, *ACCOUNT_CONTEXT_KEYWORDS):
+            continue
+        if _is_demo_context(lowered, account.start(), account.end()):
+            continue
+        key = account.group(1)
+        if key in seen_account:
+            continue
+        seen_account.add(key)
+        counts["платежные"] += 1
     for bik in BIK_RE.finditer(normalized):
-        if _valid_bik(bik.group(1)) and has_context(lowered, bik.start(), 60, *ACCOUNT_CONTEXT_KEYWORDS):
-            counts["платежные"] += 1
+        if not (_valid_bik(bik.group(1)) and has_context(lowered, bik.start(), 60, *ACCOUNT_CONTEXT_KEYWORDS)):
+            continue
+        if _is_demo_context(lowered, bik.start(), bik.end()):
+            continue
+        key = bik.group(1)
+        if key in seen_bik:
+            continue
+        seen_bik.add(key)
+        counts["платежные"] += 1
     for cvv in CVV_RE.finditer(normalized):
-        if has_context(lowered, cvv.start(), 40, *CARD_CONTEXT_KEYWORDS):
-            counts["платежные"] += 1
+        if not has_context(lowered, cvv.start(), 40, *CARD_CONTEXT_KEYWORDS):
+            continue
+        if _is_demo_context(lowered, cvv.start(), cvv.end()):
+            continue
+        key = (cvv.group(1), cvv.start() // 200)
+        if key in seen_cvv:
+            continue
+        seen_cvv.add(key)
+        counts["платежные"] += 1
 
     return dict(counts)
 
@@ -380,11 +559,78 @@ def detect_ner_categories(text: str) -> Dict[str, int]:
     lowered = normalized.lower()
     counts = Counter(empty_categories())
 
-    fio_hits = 0
+    try:
+        from analysis import natasha_ner
+
+        natasha_person_spans, non_person_spans = natasha_ner.analyze(normalized)
+    except Exception:
+        natasha_person_spans, non_person_spans = [], []
+
+    natasha_person_names = {name for _, _, name in natasha_person_spans}
+
+    def _inside_non_person(start: int, end: int) -> bool:
+        for span_start, span_end in non_person_spans:
+            if start >= span_start and end <= span_end:
+                return True
+        return False
+
+    geo_markers = (
+        "ст.", "г.", "пос.", "с.", "д.", "обл.", "край", "ул.", "наб.",
+        "пр.", "пер.", "проспект", "улица", "набережная", "область",
+        "район", "р-н", "респ.", "республика", "село", "деревня",
+        "поселок", "посёлок", "станица", "хутор",
+    )
+
+    def _has_geo_marker(start: int, end: int) -> bool:
+        left = lowered[max(0, start - 25) : start]
+        return any(marker in left for marker in geo_markers)
+
+    seen_fio: Set[str] = set()
     for match in FIO_RE.finditer(normalized):
-        if _looks_like_person_name(match.group(0), lowered, match.start(), match.end()):
-            fio_hits += 1
-    counts["обычные"] += min(10, fio_hits)
+        if _is_demo_context(lowered, match.start(), match.end()):
+            continue
+        if _inside_non_person(match.start(), match.end()):
+            continue
+        if _has_geo_marker(match.start(), match.end()):
+            continue
+        key = _normalize_fio(match.group(0))
+        if key in seen_fio:
+            continue
+        confirmed_by_natasha = key in natasha_person_names or any(
+            key in person or person in key for person in natasha_person_names
+        )
+        if not confirmed_by_natasha:
+            if not _looks_like_person_name(match.group(0), lowered, match.start(), match.end()):
+                continue
+        seen_fio.add(key)
+
+    latin_person_keywords = (
+        "employee", "candidate", "applicant", "patient",
+        "full name", "first name", "last name", "surname", "name:",
+    )
+    for match in FIO_LATIN_RE.finditer(normalized):
+        fragment = surrounding_fragment(lowered, match.start(), match.end(), radius=80)
+        if not any(keyword in fragment for keyword in latin_person_keywords):
+            continue
+        if _is_demo_context(lowered, match.start(), match.end()):
+            continue
+        key = _normalize_fio(match.group(0))
+        if key in seen_fio:
+            continue
+        seen_fio.add(key)
+
+    for span_start, span_end, person in natasha_person_spans:
+        if person in seen_fio:
+            continue
+        if len(person.split()) < 2:
+            continue
+        if _is_demo_context(lowered, span_start, span_end):
+            continue
+        if _has_geo_marker(span_start, span_end):
+            continue
+        seen_fio.add(person)
+
+    counts["обычные"] += min(10, len(seen_fio))
 
     dob_hits = 0
     for match in DOB_RE.finditer(normalized):

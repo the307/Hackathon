@@ -75,6 +75,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="Количество параллельных веток анализа текста одного документа.",
     )
+    parser.add_argument(
+        "--file-workers",
+        type=int,
+        default=1,
+        help="Сколько файлов обрабатывать параллельно (>=2 включает file-level параллелизм).",
+    )
+    parser.add_argument(
+        "--warmup-model",
+        action="store_true",
+        help="Прогреть модельный классификатор до начала сканирования.",
+    )
+    parser.add_argument(
+        "--debug-progress",
+        action="store_true",
+        help="Печатать для каждого файла его расширение и время обработки.",
+    )
     return parser
 
 
@@ -93,10 +109,26 @@ def main() -> int:
         enable_ocr=args.enable_ocr,
         include_empty_results=args.include_empty_results,
         analysis_workers=args.analysis_workers,
+        file_workers=args.file_workers,
+        debug_progress=args.debug_progress,
     )
 
     if not config.root.exists():
         parser.error(f"Путь не найден: {config.root}")
+
+    if args.warmup_model:
+        try:
+            from analysis.model_special_classifier import _load_model_bundle
+
+            _load_model_bundle()
+        except Exception:
+            pass
+        try:
+            from analysis import natasha_ner
+
+            natasha_ner.warmup()
+        except Exception:
+            pass
 
     results = scan_root(config)
     config.output.parent.mkdir(parents=True, exist_ok=True)

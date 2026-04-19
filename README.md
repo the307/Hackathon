@@ -98,6 +98,7 @@ python main.py "ПДнDataset/share" --output result.csv --output-format csv
 - `--enable-ocr` — включить OCR, если зависимости установлены.
 - `--include-empty-results` — включить файлы без находок.
 - `--analysis-workers` — число параллельных веток анализа текста.
+- `--debug-progress` — печатать для каждого файла прогресс `текущий/всего`, его расширение и время обработки.
 
 ## Формат результата хакатона
 

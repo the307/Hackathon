@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict
 
-from detectors import BIOMETRIC_KEYWORDS, SPECIAL_KEYWORDS
+from detectors import BIOMETRIC_KEYWORDS, PERSON_CONTEXT_KEYWORDS, SPECIAL_KEYWORDS
 
 
 MODEL_DIR = Path(__file__).resolve().parents[1] / "model_artifacts" / "special_pii_classifier"
@@ -113,7 +113,24 @@ def _load_model_bundle():
     return torch, tokenizer, model
 
 
-def predict_special_labels(text: str, threshold: float = DEFAULT_THRESHOLD) -> Dict[str, int]:
+def _select_relevant_chunks(chunks: list[str], max_chunks: int) -> list[str]:
+    if not chunks:
+        return []
+    scored: list[tuple[int, int, str]] = []
+    for index, chunk in enumerate(chunks):
+        lowered = chunk.lower()
+        score = sum(1 for keyword in _TRIGGER_KEYWORDS if keyword in lowered)
+        if score == 0 and any(keyword in lowered for keyword in _PERSON_TRIGGERS):
+            score = 1
+        if score > 0:
+            scored.append((-score, index, chunk))
+    if scored:
+        scored.sort()
+        return [item[2] for item in scored[:max_chunks]]
+    return chunks[:max_chunks]
+
+
+def predict_special_labels(text: str, threshold: float = DEFAULT_THRESHOLD, max_chunks: int = 3) -> Dict[str, int]:
     bundle = _load_model_bundle()
     if bundle is None:
         return {}
@@ -123,20 +140,22 @@ def predict_special_labels(text: str, threshold: float = DEFAULT_THRESHOLD) -> D
     if not chunks:
         return {}
 
-    probabilities = torch.zeros(len(MODEL_LABELS), dtype=torch.float32)
+    relevant = _select_relevant_chunks(chunks, max_chunks)
+    if not relevant:
+        return {}
+
     with torch.no_grad():
-        for chunk in chunks[:8]:
-            encoded = tokenizer(
-                chunk,
-                truncation=True,
-                padding=True,
-                max_length=512,
-                return_tensors="pt",
-            )
-            outputs = model(**encoded)
-            logits = outputs.logits.squeeze(0)
-            probs = torch.sigmoid(logits).cpu()
-            probabilities = torch.maximum(probabilities, probs)
+        encoded = tokenizer(
+            relevant,
+            truncation=True,
+            padding=True,
+            max_length=384,
+            return_tensors="pt",
+        )
+        outputs = model(**encoded)
+        logits = outputs.logits
+        probs = torch.sigmoid(logits)
+        probabilities = probs.max(dim=0).values.cpu()
 
     return {
         MODEL_LABELS[index]: 1
@@ -159,16 +178,36 @@ def has_any_label_evidence(text: str) -> bool:
     return any(has_label_evidence(text, label) for label in LABEL_EVIDENCE_KEYWORDS)
 
 
+_TRIGGER_KEYWORDS = (
+    {keyword for keywords in LABEL_EVIDENCE_KEYWORDS.values() for keyword in keywords}
+    | set(BIOMETRIC_KEYWORDS)
+    | set(SPECIAL_KEYWORDS)
+)
+_PERSON_TRIGGERS = set(PERSON_CONTEXT_KEYWORDS)
+_MIN_DOC_LEN_FOR_MODEL = 1500
+
+
+@lru_cache(maxsize=2048)
+def _should_run_model_cached(text_hash: int, sample: str, length: int) -> bool:
+    if not sample:
+        return False
+    if is_policy_noise(sample) and not has_any_label_evidence(sample):
+        return False
+    if any(keyword in sample for keyword in _TRIGGER_KEYWORDS):
+        return True
+    if length >= _MIN_DOC_LEN_FOR_MODEL:
+        person_hits = sum(1 for keyword in _PERSON_TRIGGERS if keyword in sample)
+        if person_hits >= 2:
+            return True
+    return False
+
+
 def should_run_model(text: str) -> bool:
     lowered = (text or "").lower()
     if not lowered:
         return False
-    if is_policy_noise(lowered) and not has_any_label_evidence(lowered):
-        return False
-    trigger_keywords = {keyword for keywords in LABEL_EVIDENCE_KEYWORDS.values() for keyword in keywords}
-    trigger_keywords.update(BIOMETRIC_KEYWORDS)
-    trigger_keywords.update(SPECIAL_KEYWORDS)
-    return any(keyword in lowered for keyword in trigger_keywords)
+    sample = lowered if len(lowered) <= 4000 else lowered[:2000] + lowered[-2000:]
+    return _should_run_model_cached(hash(sample), sample, len(lowered))
 
 
 def map_model_predictions_to_categories(text: str, labels: Dict[str, int]) -> Dict[str, int]:

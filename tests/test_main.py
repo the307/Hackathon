@@ -8,6 +8,10 @@ class MainCliTests(unittest.TestCase):
         args = build_parser().parse_args([])
         self.assertEqual(args.root, str(DEFAULT_DATASET_ROOT))
 
+    def test_debug_progress_flag_is_parsed(self):
+        args = build_parser().parse_args(["--debug-progress"])
+        self.assertTrue(args.debug_progress)
+
 
 if __name__ == "__main__":
     unittest.main()
